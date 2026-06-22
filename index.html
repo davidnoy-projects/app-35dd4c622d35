@@ -2658,6 +2658,43 @@
     .mood-chart svg { width: 100%; height: 120px; display: block; }
     .mood-chart-xaxis { display: flex; justify-content: space-between; font-size: 9px; color: var(--muted); margin-top: 2px; }
 
+    /* ── Mood history modal — a stock-ticker-style mood graph ── */
+    .mh-modal { width: 720px; max-width: 96vw; }
+    .mh-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+    .mh-stats { display: flex; gap: 8px; flex-wrap: wrap; }
+    .mh-stat { background: var(--surface2); border-radius: var(--radius-md); padding: 6px 10px; min-width: 64px; }
+    .mh-stat-lbl { font-size: 9.5px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+    .mh-stat-val { font-size: 16px; font-weight: 800; color: var(--text-strong); line-height: 1.15; }
+    .mh-stat-val.big { font-size: 18px; }
+    .mh-ranges { display: flex; gap: 4px; flex-wrap: wrap; }
+    .mh-range {
+      font-size: 11px; font-weight: 700; color: var(--muted);
+      background: none; border: 1px solid var(--border); border-radius: var(--radius-full);
+      padding: 4px 11px; cursor: pointer; transition: background var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out), border-color var(--dur-fast) var(--ease-out);
+    }
+    .mh-range:hover { background: var(--primary-light); color: var(--text); }
+    .mh-range.active { background: var(--primary); border-color: var(--primary); color: #04121f; }
+    .mh-plot-wrap { position: relative; margin-top: 6px; border: 1px solid var(--border); border-radius: var(--radius-lg); background: var(--surface2); overflow: hidden; }
+    .mh-scroll { overflow-x: auto; overflow-y: hidden; -webkit-overflow-scrolling: touch; }
+    .mh-scroll svg { display: block; touch-action: pan-x; }
+    .mh-yaxis { position: absolute; left: 0; top: 0; bottom: 0; width: 26px; pointer-events: none; }
+    .mh-tooltip {
+      position: absolute; pointer-events: none; z-index: 5; opacity: 0;
+      transform: translate(-50%, -100%); transition: opacity var(--dur-fast) var(--ease-out);
+      background: var(--surface-solid); border: 1px solid var(--border-strong); border-radius: var(--radius-md);
+      padding: 6px 9px; font-size: 11px; color: var(--text); box-shadow: var(--shadow-md); white-space: nowrap; min-width: 96px;
+    }
+    .mh-tooltip.show { opacity: 1; }
+    .mh-tt-date { font-size: 9.5px; color: var(--muted); margin-bottom: 2px; }
+    .mh-tt-mood { font-weight: 800; }
+    .mh-tt-note { font-size: 10px; color: var(--muted); margin-top: 3px; max-width: 200px; white-space: normal; }
+    .mh-empty { text-align: center; color: var(--muted); font-size: 13px; padding: 36px 16px; }
+    .mh-hint { font-size: 10px; color: var(--muted); text-align: center; margin-top: 8px; }
+    @media (max-width: 520px) {
+      .mh-stat { min-width: 56px; padding: 5px 8px; }
+      .mh-stat-val { font-size: 14px; }
+    }
+
     /* [feat:brief] Compact glanceable "your day" card. Mirrors .briefing-card chrome
        but denser; single-row clamp per line, full text in title attr. */
     .daily-brief {
@@ -20776,6 +20813,21 @@ function renderMoodPopover() {
         pop.appendChild(hint);
       }
     }
+
+    // "View full history" — opens the big scrollable mood-graph modal. Shown once
+    // there are at least two entries to draw a line between (independent of the
+    // inline-plot worthiness gate above).
+    if (normalizeMoodLog(log).length >= 2) {
+      const hist = document.createElement('button');
+      hist.type = 'button';
+      hist.className = 'mood-pop-more';
+      hist.textContent = '📈 View full history';
+      hist.addEventListener('click', function () {
+        closeMoodMeter();
+        openMoodHistory();
+      });
+      pop.appendChild(hist);
+    }
   } catch (_) {}
 }
 
@@ -20808,6 +20860,228 @@ document.addEventListener('click', function (e) {
 try { refreshMoodGlyph(); } catch (_) {}
 if (document.readyState === 'loading') {
   document.addEventListener('DOMContentLoaded', function () { try { refreshMoodGlyph(); } catch (_) {} });
+}
+
+// ── Mood history modal — a scrollable, time-horizon stock-ticker-style graph ──
+// Entry point: the "📈 View full history" button in the mood popover.
+const MOOD_HIST_RANGES = [
+  { key: '1w', label: '1W', days: 7 },
+  { key: '1m', label: '1M', days: 30 },
+  { key: '3m', label: '3M', days: 90 },
+  { key: '6m', label: '6M', days: 182 },
+  { key: '1y', label: '1Y', days: 365 },
+  { key: 'all', label: 'All', days: Infinity },
+];
+let _moodHistRange = '3m';
+let _moodHistPts = [];      // [{x,y,ts,avg,count,note}] for hover scrubbing
+let _moodHistGeom = null;   // {W,H,PADT,PADB}
+
+function _moodScoreColor(v) { return v < 2.5 ? 'var(--danger)' : (v < 3.5 ? 'var(--warning)' : 'var(--success)'); }
+function _moodFaceFor(v) { return MOOD_FACES[Math.max(1, Math.min(5, Math.round(v)))] || '🙂'; }
+function _moodLabelFor(v) { return MOOD_LABELS[Math.max(1, Math.min(5, Math.round(v)))] || ''; }
+
+// _moodHistData(log, range, nowMs) — pure. Filter to the range window, aggregate
+// by LOCAL calendar day (mean score per day), return ascending points + summary.
+function _moodHistData(log, range, nowMs) {
+  const pts0 = normalizeMoodLog(log);
+  const now = isFinite(nowMs) ? nowMs : Date.now();
+  const cfg = MOOD_HIST_RANGES.find(r => r.key === range) || MOOD_HIST_RANGES[MOOD_HIST_RANGES.length - 1];
+  const cutoff = (cfg.days === Infinity) ? -Infinity : now - cfg.days * 86400000;
+  const inRange = pts0.filter(p => p.ts >= cutoff && p.ts <= now);
+  const byDay = new Map();
+  for (const p of inRange) {
+    const d = new Date(p.ts);
+    const key = d.getFullYear() + '-' + d.getMonth() + '-' + d.getDate();
+    const dayMid = new Date(d.getFullYear(), d.getMonth(), d.getDate(), 12, 0, 0).getTime();
+    let g = byDay.get(key);
+    if (!g) { g = { ts: dayMid, sum: 0, count: 0, lastTs: -1, note: '' }; byDay.set(key, g); }
+    g.sum += p.score; g.count++;
+    if (p.ts >= g.lastTs) { g.lastTs = p.ts; g.note = (typeof p.note === 'string') ? p.note : ''; }
+  }
+  const points = [...byDay.values()]
+    .map(g => ({ ts: g.ts, avg: g.sum / g.count, count: g.count, note: g.note }))
+    .sort((a, b) => a.ts - b.ts);
+  const totalEntries = inRange.length;
+  const avgAll = totalEntries ? inRange.reduce((s, p) => s + p.score, 0) / totalEntries : null;
+  // trend: mean of first half of days vs second half
+  let trend = 0;
+  if (points.length >= 2) {
+    const mid = Math.floor(points.length / 2);
+    const a = points.slice(0, mid), b = points.slice(mid);
+    const ma = a.reduce((s, p) => s + p.avg, 0) / a.length;
+    const mb = b.reduce((s, p) => s + p.avg, 0) / b.length;
+    trend = mb - ma;
+  }
+  return { points, totalEntries, avgAll, trend, range: cfg.key,
+           from: points.length ? points[0].ts : null, to: points.length ? points[points.length - 1].ts : null };
+}
+
+// Span-driven so labels are always unambiguous and granular: weekday for a couple
+// weeks, month+day up to ~13 months, month+year beyond (avoids "May 26" reading as
+// a day-of-month when it means May 2026).
+function _moodHistFmtTick(ts, spanMs) {
+  try {
+    const d = new Date(ts);
+    if (spanMs <= 14 * 86400000) return d.toLocaleDateString(undefined, { weekday: 'short' });
+    if (spanMs <= 400 * 86400000) return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+    return d.toLocaleDateString(undefined, { month: 'short', year: 'numeric' });
+  } catch (_) { return ''; }
+}
+
+// _moodHistChartSVG(data, innerW) — build the SVG + the px-space point list for
+// hover. Index-based x (each tracked day = an equal slot), 1..5 y with emoji axis,
+// gradient area fill, score-colored dots, crosshair + focus markers for scrubbing.
+function _moodHistChartSVG(data, innerW) {
+  const pts = data.points;
+  const n = pts.length;
+  const H = 264, PADL = 30, PADR = 16, PADT = 18, PADB = 26;
+  const minGap = 26;
+  const W = Math.max(innerW || 640, PADL + PADR + (n - 1) * minGap + 24);
+  const xOf = i => PADL + (n === 1 ? 0 : (i / (n - 1)) * (W - PADL - PADR));
+  const yOf = sc => PADT + (1 - (Math.max(1, Math.min(5, sc)) - 1) / 4) * (H - PADT - PADB);
+  const P = pts.map((p, i) => ({ x: xOf(i), y: yOf(p.avg), ts: p.ts, avg: p.avg, count: p.count, note: p.note }));
+
+  let grid = '';
+  for (let s = 1; s <= 5; s++) {
+    const y = yOf(s).toFixed(1);
+    grid += `<line x1="${PADL}" y1="${y}" x2="${(W - PADR).toFixed(1)}" y2="${y}" stroke="var(--border)" stroke-width="0.6"/>`;
+    grid += `<text x="6" y="${(yOf(s) + 4).toFixed(1)}" font-size="12">${MOOD_FACES[s]}</text>`;
+  }
+  // x ticks (~6 evenly spaced by index); label format driven by the visible span
+  const spanMs = (n >= 2) ? (pts[n - 1].ts - pts[0].ts) : 0;
+  const ticks = Math.min(6, n - 1);
+  let xax = '';
+  for (let t = 0; t <= ticks; t++) {
+    const i = Math.round((t / ticks) * (n - 1));
+    const x = xOf(i);
+    xax += `<text x="${x.toFixed(1)}" y="${(H - 8).toFixed(1)}" font-size="9" fill="var(--muted)" text-anchor="middle">${esc(_moodHistFmtTick(pts[i].ts, spanMs))}</text>`;
+  }
+  const linePath = P.map((p, i) => `${i === 0 ? 'M' : 'L'}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ');
+  const areaPath = `${linePath} L${P[P.length - 1].x.toFixed(1)},${(H - PADB).toFixed(1)} L${P[0].x.toFixed(1)},${(H - PADB).toFixed(1)} Z`;
+  const dots = P.map(p =>
+    `<circle cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="3" fill="${_moodScoreColor(p.avg)}" stroke="var(--surface-solid)" stroke-width="1"/>`).join('');
+
+  const svg = `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" style="width:${W}px;height:${H}px">
+    <defs><linearGradient id="mhGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="var(--primary)" stop-opacity="0.30"/>
+      <stop offset="1" stop-color="var(--primary)" stop-opacity="0"/>
+    </linearGradient></defs>
+    ${grid}
+    <path d="${areaPath}" fill="url(#mhGrad)" stroke="none"/>
+    <path d="${linePath}" fill="none" stroke="var(--primary)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+    ${dots}
+    <line class="mh-cross" x1="0" y1="${PADT}" x2="0" y2="${H - PADB}" stroke="var(--muted)" stroke-width="1" stroke-dasharray="3 3" style="opacity:0"/>
+    <circle class="mh-focus" r="5" fill="none" stroke="var(--primary)" stroke-width="2" style="opacity:0"/>
+    ${xax}
+  </svg>`;
+  return { svg, pts: P, geom: { W, H, PADT, PADB } };
+}
+
+function _ensureMoodHistoryModal() {
+  if (document.getElementById('moodHistoryModal')) return;
+  const host = document.createElement('div');
+  host.innerHTML =
+    '<div class="overlay" id="moodHistoryModal">' +
+      '<div class="modal mh-modal">' +
+        '<div class="modal-title">📈 Mood history</div>' +
+        '<div class="mh-head"><div class="mh-stats"></div><div class="mh-ranges"></div></div>' +
+        '<div class="mh-plot-wrap"></div>' +
+        '<div class="mh-hint">Hover or drag across the graph to scrub · scroll sideways for longer history</div>' +
+        '<div class="mactions" style="margin-top:14px;display:flex;justify-content:flex-end">' +
+          '<button type="button" class="btn btn-ghost" onclick="closeModal(\'moodHistoryModal\')">Close</button>' +
+        '</div>' +
+      '</div>' +
+    '</div>';
+  const overlay = host.firstElementChild;
+  document.body.appendChild(overlay);
+  overlay.querySelector('.mh-ranges').addEventListener('click', function (e) {
+    const b = e.target.closest('.mh-range');
+    if (b) renderMoodHistory(b.getAttribute('data-range'));
+  });
+}
+
+function openMoodHistory() {
+  try {
+    _ensureMoodHistoryModal();
+    if (!_moodHistRange) _moodHistRange = '3m';
+    openModal('moodHistoryModal');
+    renderMoodHistory(_moodHistRange);
+  } catch (_) {}
+}
+
+function renderMoodHistory(range) {
+  try {
+    _ensureMoodHistoryModal();
+    if (range) _moodHistRange = range;
+    const modal = document.getElementById('moodHistoryModal');
+    if (!modal) return;
+    const log = (S && Array.isArray(S.moodLog)) ? S.moodLog : [];
+    const data = _moodHistData(log, _moodHistRange, Date.now());
+
+    // range buttons
+    modal.querySelector('.mh-ranges').innerHTML = MOOD_HIST_RANGES.map(r =>
+      `<button type="button" class="mh-range${r.key === _moodHistRange ? ' active' : ''}" data-range="${r.key}">${r.label}</button>`).join('');
+
+    // stat cards
+    const trIcon = data.trend > 0.15 ? '▲' : (data.trend < -0.15 ? '▼' : '▬');
+    const trColor = data.trend > 0.15 ? 'var(--success)' : (data.trend < -0.15 ? 'var(--danger)' : 'var(--muted)');
+    const statsHtml =
+      `<div class="mh-stat"><div class="mh-stat-lbl">Average</div><div class="mh-stat-val big">${data.avgAll != null ? _moodFaceFor(data.avgAll) + ' ' + data.avgAll.toFixed(1) : '—'}</div></div>` +
+      `<div class="mh-stat"><div class="mh-stat-lbl">Check-ins</div><div class="mh-stat-val">${data.totalEntries}</div></div>` +
+      `<div class="mh-stat"><div class="mh-stat-lbl">Days</div><div class="mh-stat-val">${data.points.length}</div></div>` +
+      `<div class="mh-stat"><div class="mh-stat-lbl">Trend</div><div class="mh-stat-val" style="color:${trColor}">${trIcon}${Math.abs(data.trend) >= 0.05 ? ' ' + Math.abs(data.trend).toFixed(1) : ''}</div></div>`;
+    modal.querySelector('.mh-stats').innerHTML = statsHtml;
+
+    const wrap = modal.querySelector('.mh-plot-wrap');
+    if (data.points.length < 2) {
+      wrap.innerHTML = '<div class="mh-empty">No mood entries in this range yet.<br>Keep logging and your graph will fill in.</div>';
+      _moodHistPts = []; _moodHistGeom = null;
+      return;
+    }
+    const innerW = (wrap.clientWidth || 640) - 2;
+    const built = _moodHistChartSVG(data, innerW);
+    wrap.innerHTML = `<div class="mh-scroll">${built.svg}</div><div class="mh-tooltip"></div>`;
+    _moodHistPts = built.pts; _moodHistGeom = built.geom;
+    _wireMoodHistHover(wrap);
+  } catch (_) {}
+}
+
+function _wireMoodHistHover(wrap) {
+  try {
+    const scroll = wrap.querySelector('.mh-scroll');
+    const svg = scroll.querySelector('svg');
+    const tip = wrap.querySelector('.mh-tooltip');
+    const cross = svg.querySelector('.mh-cross');
+    const focus = svg.querySelector('.mh-focus');
+    if (!svg || !tip || !_moodHistGeom) return;
+    const geom = _moodHistGeom;
+    const onMove = (clientX) => {
+      const rect = svg.getBoundingClientRect();
+      if (!rect.width) return;
+      const xUser = (clientX - rect.left) * (geom.W / rect.width);
+      let best = _moodHistPts[0], bd = Infinity;
+      for (const p of _moodHistPts) { const dd = Math.abs(p.x - xUser); if (dd < bd) { bd = dd; best = p; } }
+      if (!best) return;
+      cross.setAttribute('x1', best.x); cross.setAttribute('x2', best.x); cross.style.opacity = '1';
+      focus.setAttribute('cx', best.x); focus.setAttribute('cy', best.y); focus.style.opacity = '1';
+      const wrapRect = wrap.getBoundingClientRect();
+      const scale = rect.width / geom.W;
+      const left = rect.left + best.x * scale - wrapRect.left;
+      const top = rect.top + best.y * scale - wrapRect.top;
+      tip.style.left = left + 'px';
+      tip.style.top = (top - 10) + 'px';
+      let d; try { d = new Date(best.ts).toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' }); } catch (_) { d = ''; }
+      let html = `<div class="mh-tt-date">${esc(d)}</div><div class="mh-tt-mood">${_moodFaceFor(best.avg)} ${best.avg.toFixed(1)} · ${esc(_moodLabelFor(best.avg))}</div>`;
+      if (best.count > 1) html += `<div class="mh-tt-note">${best.count} check-ins that day</div>`;
+      if (best.note) html += `<div class="mh-tt-note">“${esc(best.note)}”</div>`;
+      tip.innerHTML = html;
+      tip.classList.add('show');
+    };
+    const hide = () => { tip.classList.remove('show'); if (cross) cross.style.opacity = '0'; if (focus) focus.style.opacity = '0'; };
+    scroll.addEventListener('pointermove', (e) => onMove(e.clientX));
+    scroll.addEventListener('pointerdown', (e) => onMove(e.clientX));
+    scroll.addEventListener('pointerleave', hide);
+  } catch (_) {}
 }
 // [/feat:mood] ═══════════════════════════════════════════════════════════════
 
