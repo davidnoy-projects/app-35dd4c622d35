@@ -7886,6 +7886,25 @@ function openGoogleCalendar(d) {
   window.open(url, '_blank', 'noopener');
 }
 
+// Only ever open https Google Calendar / Google links — never inject an
+// arbitrary (possibly attacker-influenced) URL from a feed into window.open.
+function _isGoogleCalUrl(u) {
+  return typeof u === 'string'
+    && /^https:\/\/(www\.|calendar\.)?google\.com\/[^\s"'<>]*$/i.test(u);
+}
+// Birthday-row click target lookups are kept out of the HTML (no URL is ever
+// interpolated into an inline handler) — rows reference an index into this
+// array, populated by renderBirthdaySection().
+let _bdayClickTargets = [];
+function _openBirthdayEntry(idx) {
+  const t = _bdayClickTargets[Number(idx)];
+  if (!t) return;
+  if (_isGoogleCalUrl(t.link)) { window.open(t.link, '_blank', 'noopener'); return; }
+  // ICS feed (or no direct link): fall back to the Google Calendar day view for
+  // the birthday's date — the best target available without an event id.
+  openGoogleCalendar(new Date(t.y, t.m, t.d));
+}
+
 /* ── Calendar: ICS parser for today's events strip ──
    Supports a single public ICS URL (Google Calendar "secret" ICS,
    Outlook.com public ICS, Apple iCloud). Fetched through allorigins/codetabs
@@ -8218,7 +8237,8 @@ async function fetchGoogleCalendarEvents() {
     if (!start) return null;
     return {
       title: it.summary || '(untitled)', start, end, rrule: '', exdates: new Set(), responseTag: _gcalEventResponseTag(it),
-      gcalType: (it.eventType && String(it.eventType)) || '', _raw: startRaw
+      gcalType: (it.eventType && String(it.eventType)) || '', _raw: startRaw,
+      htmlLink: (typeof it.htmlLink === 'string' ? it.htmlLink : '')   // direct link to the Google Calendar entry
     };
   }).filter(Boolean);
 }
@@ -8530,6 +8550,7 @@ function renderBirthdaySection() {
   }
   const now = new Date();
   const rows = [];
+  _bdayClickTargets = [];
   for (let add = 0; add < 7; add++) {
     const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() + add);
     const bds = [];
@@ -8541,7 +8562,12 @@ function renderBirthdaySection() {
     bds.sort((a, b) => (a.title || '').localeCompare(b.title || ''));
     const chip = esc(_calDayStripLabel(d));
     bds.forEach(ev => {
-      rows.push(`<div class="cal-bd-row"><span class="cal-bd-chip">${chip}</span><div class="cal-bd-n"><span class="ce-inner">${esc(ev.title || '(untitled)')}${_calEventResponseBadgeHTML(ev)}</span></div></div>`);
+      // Click → the event's own Google Calendar entry (Google API path), else
+      // the day view for that date (ICS path). Targets are stored out-of-band
+      // and referenced by index so no URL is ever injected into the markup.
+      const idx = _bdayClickTargets.length;
+      _bdayClickTargets.push({ link: ev.htmlLink || '', y: d.getFullYear(), m: d.getMonth(), d: d.getDate() });
+      rows.push(`<div class="cal-bd-row" role="link" tabindex="0" title="Open in Google Calendar" style="cursor:pointer" onclick="_openBirthdayEntry(${idx})" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();_openBirthdayEntry(${idx});}"><span class="cal-bd-chip">${chip}</span><div class="cal-bd-n"><span class="ce-inner">${esc(ev.title || '(untitled)')}${_calEventResponseBadgeHTML(ev)}</span></div></div>`);
     });
   }
   if (!rows.length) {
@@ -25020,12 +25046,16 @@ window.addEventListener('pagehide', () => { try { save({ mirror: true }); } catc
     localStorage.setItem(CACHE_KEY, JSON.stringify(c));
   }
 
-  // ── Prune flights older than 1 day ──────────────────────────────────────────
+  // ── Prune past flights ───────────────────────────────────────────────────────
+  // "Past" = the flight's date is the previous day or earlier (before today).
+  // Today's flights are kept; anything dated yesterday-or-older is dropped (no
+  // need to keep them around). Uses the LOCAL calendar date — f.date is a local
+  // YYYY-MM-DD, so comparing against a UTC `toISOString()` day could be off by
+  // one in the evening; build today's local date string explicitly.
   function pruneOld(list) {
-    const cutoff = new Date();
-    cutoff.setDate(cutoff.getDate() - 1);
-    const cutoffStr = cutoff.toISOString().slice(0, 10);
-    return list.filter(f => !f.date || f.date >= cutoffStr);
+    const n = new Date();
+    const todayStr = n.getFullYear() + '-' + String(n.getMonth() + 1).padStart(2, '0') + '-' + String(n.getDate()).padStart(2, '0');
+    return list.filter(f => !f.date || f.date >= todayStr);
   }
 
   // ── Sort by date then departure time ────────────────────────────────────────
@@ -25211,25 +25241,30 @@ window.addEventListener('pagehide', () => { try { save({ mirror: true }); } catc
       const dateLine = dateFmt ? `<div style="font-size:11px;color:var(--text);margin-top:2px">${esc(dateFmt)}</div>` : '';
       const metaLine = esc(code) + (aircraft ? '  ' + aircraftHtml(aircraft) : '');
 
-      // Times: show sched struck-through when est/actual differs; fall back to pasted if no live times
-      function timeCol(label, sched, est, actual, fallback) {
+      // Times: show sched struck-through when est/actual differs; fall back to pasted if no live times.
+      // terminal/gate (when the source provides them) render as a small line under the times.
+      function timeCol(label, sched, est, actual, fallback, terminal, gate) {
         const hasLive = sched || est || actual;
-        if (!hasLive && !fallback) return '';
+        if (!hasLive && !fallback && !terminal && !gate) return '';
         const schedStruck = sched && (actual || (est && est !== sched));
+        const tg = [terminal ? 'Term ' + esc(terminal) : '', gate ? 'Gate ' + esc(gate) : ''].filter(Boolean).join(' · ');
         return `<div class="ft-card-col">
           <span style="font-size:10px;color:var(--muted)">${label}</span>
           ${schedStruck ? `<span class="ft-card-sched" style="text-decoration:line-through;opacity:0.45">${esc(sched)}</span>` : (sched ? `<span class="ft-card-sched">${esc(sched)}</span>` : '')}
           ${est && est !== sched && !actual ? `<span class="ft-card-est" style="font-weight:700">${esc(est)} est</span>` : ''}
           ${actual ? `<span class="ft-card-actual" style="font-weight:700">${esc(actual)}</span>` : ''}
           ${!hasLive && fallback ? `<span class="ft-card-sched">${esc(fallback)}</span>` : ''}
+          ${tg ? `<span class="ft-card-tg" style="font-size:9.5px;color:var(--muted);margin-top:1px">${tg}</span>` : ''}
         </div>`;
       }
-      const depCol = timeCol('DEP', live.depSched||'', live.depEst||'', live.depActual||'', f.depTime||'');
-      const arrCol = timeCol('ARR', live.arrSched||'', live.arrEst||'', live.arrActual||'', f.arrTime||'');
+      const depCol = timeCol('DEP', live.depSched||'', live.depEst||'', live.depActual||'', f.depTime||'', live.depTerminal||'', live.depGate||'');
+      const arrCol = timeCol('ARR', live.arrSched||'', live.arrEst||'', live.arrActual||'', f.arrTime||'', live.arrTerminal||'', live.arrGate||'');
       const timesHtml = (depCol || arrCol) ? `<div class="ft-card-times">${depCol}${arrCol}</div>` : '';
 
-      const durLine = !live.depSched && f.duration
-        ? `<div class="ft-card-meta" style="color:var(--muted);font-size:10px">${esc(f.duration)}</div>` : '';
+      // Flight length: prefer the live "Duration", fall back to the pasted itinerary value.
+      const durStr = live.duration || f.duration || '';
+      const durLine = durStr
+        ? `<div class="ft-card-meta" style="color:var(--muted);font-size:10px">⏱ ${esc(durStr)}</div>` : '';
 
       // Badge with inline color so we're not relying on CSS class name alignment
       let badgeStyle = 'background:#1e293b;color:var(--muted);';
@@ -25412,6 +25447,9 @@ window.addEventListener('pagehide', () => { try { save({ mirror: true }); } catc
     }, 800);
   };
 
+  // Test seam (read-only): expose the pure-ish helpers for the regression harness.
+  window._ftTestHooks = { pruneOld, cardHTML };
+
   renderAndFetch();
 })();
 
@@ -25547,9 +25585,10 @@ window.addEventListener('pagehide', () => { try { save({ mirror: true }); } catc
   }
   window.parseHotel = parseHotel;
 
+  // Prune past stays: a stay whose check-out is the previous day or earlier
+  // (before today) is dropped. A stay checking out today is kept through today.
   function prune(list){
-    const cutoff = new Date(); cutoff.setDate(cutoff.getDate()-1);
-    const c = _iso(cutoff);
+    const c = _iso(new Date());
     return list.filter(h => !h.checkOut || h.checkOut >= c);
   }
   function sortStays(list){ return [...list].sort((a,b) => (a.checkIn||'') < (b.checkIn||'') ? -1 : (a.checkIn||'') > (b.checkIn||'') ? 1 : 0); }
@@ -25723,6 +25762,9 @@ window.addEventListener('pagehide', () => { try { save({ mirror: true }); } catc
       daysUntil: h.checkIn ? Math.round((new Date(h.checkIn+'T00:00:00') - new Date(today+'T00:00:00')) / 86400000) : null,
     }));
   };
+
+  // Test seam (read-only): expose the pure prune helper for the regression harness.
+  window._htTestHooks = { prune };
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', render);
   else render();
