@@ -5614,7 +5614,7 @@ function normalizeImportedState(raw) {
   next.earningsReactionEnabled   = next.earningsReactionEnabled !== false;        // default true
   next.sentimentDivergence       = next.sentimentDivergence === true;             // default OFF
   next.sectorHeatmap       = (next.sectorHeatmap && typeof next.sectorHeatmap === 'object') ? next.sectorHeatmap : { enabled: true, timeframes: ['1w','1m','3m'] };
-  next.pickerSettings      = (next.pickerSettings && typeof next.pickerSettings === 'object') ? next.pickerSettings : { horizon: 14, numPicks: 3, minThreshold: 0.35, enabled: true };
+  next.pickerSettings      = (next.pickerSettings && typeof next.pickerSettings === 'object') ? next.pickerSettings : { horizon: 14, numPicks: 5, minConfidence: 0.35, enabled: true };
   next.pickerJournal       = (next.pickerJournal && typeof next.pickerJournal === 'object') ? next.pickerJournal : {};
   next.pickerLearnedWeights = (next.pickerLearnedWeights && typeof next.pickerLearnedWeights === 'object') ? next.pickerLearnedWeights : null;
 
@@ -15116,10 +15116,15 @@ function saveDailyPriceSnapshot() {
       _peerCacheRawMemo = raw;
     }
     const peer = _peerCacheParsedMemo || {};
-    const wanted = new Set(['SPY']);
+    // Seed every benchmark (SPY + QQQ) plus every journaled pick ticker.
+    const wanted = new Set(PICKER_BENCHMARKS);
     for (const e of Object.values(S.pickerJournal || {})) {
       for (const t of (e && e.tickers) || []) if (t && t.sym) wanted.add(String(t.sym).toUpperCase());
     }
+    // Double-seed precedence (HLD-A A3): the watchlist `stockCache` close already
+    // filled `snap[sym]` above and WINS for a given day key — we only fall back to
+    // the picker peer cache when stockCache had no price, so a promoted pick's
+    // grading price is deterministic and not order-dependent.
     for (const sym of wanted) {
       if (snap[sym] == null && peer[sym] && peer[sym].price > 0) snap[sym] = peer[sym].price;
     }
@@ -29405,10 +29410,20 @@ const PICKER_DEFAULT_WEIGHTS = {
 
 const PICKER_SETTINGS_DEFAULTS = {
   horizon:       14,
-  numPicks:      3,
+  numPicks:      5,
   minConfidence: 0.35,
   enabled:       true,
 };
+
+// Benchmarks each pick is compared against (display order; SPY stays primary).
+// "or other good indices" is real & future-proof — extend this list and both the
+// fetch seam (_renderSincePerformance batch + saveDailyPriceSnapshot wanted-set)
+// and grading pick up the new symbol automatically. PICKER_TRACK_TRAIL_DAYS is the
+// grace window after a pick's horizon ends during which it still shows as a live
+// track-record row (it drops from the live row at entry+horizon+trail, but stays
+// in the cumulative graded aggregate stats).
+const PICKER_BENCHMARKS       = ['SPY', 'QQQ'];
+const PICKER_TRACK_TRAIL_DAYS = 7;
 
 const PICKER_CACHE_KEY           = 'sp_picker_cache';
 const PICKER_RATIONALE_CACHE_KEY = 'sp_picker_rationale_cache';
@@ -29528,6 +29543,19 @@ function _pickerWriteCache(key, val) {
 function _pickerSettings() {
   if (!S.pickerSettings || typeof S.pickerSettings !== 'object') S.pickerSettings = {};
   return Object.assign({}, PICKER_SETTINGS_DEFAULTS, S.pickerSettings);
+}
+
+// Pure one-time numPicks 3→5 migration (HLD-A G3, unit-testable). Flag-guarded by
+// the caller via `sp_picker_5pick_mig` so an existing install moves to 5 ONCE
+// without ever overriding a deliberate future choice. Only the EXACT legacy value
+// 3 migrates (a user who set 4 keeps 4). Returns the (possibly mutated) settings,
+// whether it changed, and that the flag should be written (always, idempotent).
+function _pickerMigrateNumPicks(settings, hasFlag) {
+  const s = settings || {};
+  if (hasFlag) return { settings: s, changed: false, setFlag: false };
+  let changed = false;
+  if (s.numPicks === 3) { s.numPicks = 5; changed = true; }
+  return { settings: s, changed, setFlag: true };
 }
 
 // Auto-rotation cadence: hold a pick set for the FULL watch window (the horizon)
@@ -30094,6 +30122,115 @@ function _computeSincePerf(picks, priceMap, spyEntry, spyNow) {
   return { rows, avgDir, spyRet, alpha, n: valid.length };
 }
 
+// Pure compute (unit-testable): live per-index alpha for a single pending pick.
+// `entryMap`/`nowMap` are { SYM: px } for each benchmark; `dirMovePct` is the
+// pick's OWN direction-aware move% (already sign-flipped for bear); `direction`
+// is 'bull'|'bear'; `benchmarks` is the index list. Returns { SYM: {movePct, vs}
+// | null }. A bench is null (renders "—") when its entry or now price is missing.
+// vs = directional excess = dirSign * (rawPickMove - benchMove), matching the
+// graded vs_spy convention so live and final numbers are consistent.
+function _computePickBenchPerf(entryMap, nowMap, dirMovePct, direction, benchmarks) {
+  const out = {};
+  const dirSign = direction === 'bear' ? -1 : 1;
+  // Recover the RAW (non-direction-aware) pick move from the dir-aware one so the
+  // excess uses the same raw-vs-raw basis the grader does.
+  const rawPick = dirSign * (+dirMovePct);
+  for (const b of (benchmarks || [])) {
+    const e = +(entryMap || {})[b];
+    const n = +(nowMap || {})[b];
+    if (!(e > 0) || !(n > 0)) { out[b] = null; continue; }
+    const benchMove = (n - e) / e * 100;
+    out[b] = { movePct: benchMove, vs: dirSign * (rawPick - benchMove) };
+  }
+  return out;
+}
+
+// Pure compute (unit-testable): the track-record row set (HLD-A G1/G2). Walks a
+// day-keyed `journal` and returns one normalized row per ticker whose DISPLAY
+// WINDOW is still open: [entryDate, entryDate + horizon + trailDays]. Rows past
+// that window are dropped (live tracking stops; the cumulative graded aggregate
+// in getPickerStats is unaffected). State is passed explicitly — `journal` is
+// `S.pickerJournal`, `priceLookup(sym)→px|null` is the renderer-owned current-
+// price resolver (stockCache→peer→picker→dailyPriceLog), `nowMs` is Date.now().
+//
+//   row = { date, sym, name, direction, horizonDays, entryPrice, status,
+//           movePct|null, onTrack|null, correct|null, daysElapsed, daysRemaining,
+//           droppedSoon, bench }
+//
+// status: 'graded' if a graded grade exists OR daysElapsed >= horizon (past
+// window); else 'pending'. onTrack (pending only): does the live move agree with
+// the predicted direction past 0 (dead-band 0)? bench: normalized {SPY,QQQ}
+// view from grades[sym].bench, falling back to the legacy vs_spy alias for SPY;
+// missing index → null (renders "—").
+function pickerTrackRows(nowMs, journal, priceLookup, opts) {
+  const o = opts || {};
+  const trailDays = (o.trailDays != null) ? o.trailDays : PICKER_TRACK_TRAIL_DAYS;
+  const lookup = (typeof priceLookup === 'function') ? priceLookup : () => null;
+  const rows = [];
+  if (!journal || typeof journal !== 'object') return rows;
+  const now = new Date(nowMs);
+  const nowKey = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}`;
+  const keyToYmd = (k) => (k && String(k).length >= 8)
+    ? new Date(+String(k).slice(0, 4), +String(k).slice(4, 6) - 1, +String(k).slice(6, 8)) : null;
+  const dayB = keyToYmd(nowKey);
+  for (const [dateKey, entry] of Object.entries(journal)) {
+    if (!entry || !Array.isArray(entry.tickers)) continue;
+    const dayA = keyToYmd(dateKey);
+    if (!dayA || !dayB) continue;
+    const daysElapsed = Math.round((dayB - dayA) / 864e5);
+    const grades = entry.grades || {};
+    for (const t of entry.tickers) {
+      if (!t || !t.sym) continue;
+      const sym = String(t.sym).toUpperCase();
+      const horizonDays = t.horizon || entry.horizonDays || 14;
+      // Drop past the display window (entry + horizon + trail).
+      if (daysElapsed > horizonDays + trailDays) continue;
+      const g = grades[sym];
+      const isGraded = !!(g && g.graded);
+      const status = (isGraded || daysElapsed >= horizonDays) ? 'graded' : 'pending';
+      const daysRemaining = Math.max(0, horizonDays - daysElapsed);
+      const droppedSoon = daysElapsed >= horizonDays; // past window → will drop after trail
+
+      const entryPrice = +t.entryPrice;
+      // Final verdict only exists once graded; otherwise compute live move%.
+      let movePct = null, onTrack = null, correct = null;
+      if (isGraded) {
+        correct = (g.correct === true);
+        movePct = (g.movePct != null) ? +g.movePct : null;
+      } else {
+        const cur = +lookup(sym);
+        if (entryPrice > 0 && cur > 0) {
+          movePct = (cur - entryPrice) / entryPrice * 100;
+          const dirSign = t.direction === 'bear' ? -1 : 1;
+          onTrack = (dirSign * movePct) > 0;
+        }
+      }
+
+      // Normalized benchmark view: prefer grades[sym].bench; fall back to the
+      // legacy vs_spy alias for SPY. Missing index → null (renders "—").
+      let bench = null;
+      if (g && g.bench && typeof g.bench === 'object') {
+        bench = {};
+        for (const b of PICKER_BENCHMARKS) bench[b] = (g.bench[b] != null) ? g.bench[b] : null;
+      } else if (g && (g.vs_spy != null || g.spyMovePct != null)) {
+        bench = {};
+        for (const b of PICKER_BENCHMARKS) bench[b] = null;
+        bench.SPY = { movePct: (g.spyMovePct != null ? +g.spyMovePct : null), vs: (g.vs_spy != null ? +g.vs_spy : null) };
+      }
+
+      rows.push({
+        date: dateKey, sym, name: t.name || null, direction: t.direction,
+        horizonDays, entryPrice: entryPrice > 0 ? entryPrice : null,
+        status, movePct, onTrack, correct, daysElapsed, daysRemaining,
+        droppedSoon, watched: t.watched === true, bench,
+      });
+    }
+  }
+  // Newest first.
+  rows.sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
+  return rows;
+}
+
 // Fetch current prices for the active picks (+SPY) and fill the per-card
 // "Since pick" badges and the summary line. Live since-pick performance does not
 // depend on the daily grading log, so it works the moment picks exist.
@@ -30102,7 +30239,7 @@ async function _renderSincePerformance(picks) {
   if (!picks || !picks.length) { if (sinceEl) sinceEl.innerHTML = ''; return; }
   const cached = _pickerReadCache(PICKER_CACHE_KEY) || {};
   const priceMap = {}; let spyNow = null; let snap = {};
-  try { snap = await _pickerFetchSnapshot(picks.map(p => p.sym).concat('SPY')); } catch (_) {}
+  try { snap = await _pickerFetchSnapshot(picks.map(p => p.sym).concat(...PICKER_BENCHMARKS)); } catch (_) {}
   for (const k in snap) {
     if (snap[k].price > 0) priceMap[k] = snap[k].price;
     // Fill the small-print company name for any card still missing it.
@@ -30191,6 +30328,29 @@ function _removeFromTodayJournal(sym) {
   save();
 }
 
+// Pure synchronous removal half of delete-and-replace (HLD-A G5/A4, unit-testable).
+// Mutates `cached` (the picker cache payload) and `dayEntry` (the journal day) in
+// place: drops the sym from picks + rationales, drops it from the journal day's
+// tickers + grades, and records it in cached.excluded[] so neither the immediate
+// replacement nor any re-render this rotation re-surfaces it. The async fetch +
+// replacement tail stays in _deleteAndReplacePick (browser-verified). Returns
+// { removed }. Removing a watched pick drops it from tracking (the journal entry
+// goes) — leaving the watchlist entry alone is the caller's concern.
+function _pickerRemoveSync(cached, dayEntry, sym) {
+  const norm = String(sym || '').trim().toUpperCase();
+  if (!norm || !cached || !Array.isArray(cached.picks)) return { removed: false };
+  const idx = cached.picks.findIndex(p => String(p.sym).toUpperCase() === norm);
+  if (idx < 0) return { removed: false };
+  cached.picks.splice(idx, 1);
+  if (cached.rationales) delete cached.rationales[norm];
+  cached.excluded = Array.from(new Set([...(cached.excluded || []), norm]));
+  if (dayEntry && Array.isArray(dayEntry.tickers)) {
+    dayEntry.tickers = dayEntry.tickers.filter(t => String(t.sym).toUpperCase() !== norm);
+    if (dayEntry.grades) delete dayEntry.grades[norm];
+  }
+  return { removed: true };
+}
+
 function _appendReplacementToJournal(pick) {
   S.pickerJournal = S.pickerJournal || {};
   const ps = _pickerSettings();
@@ -30217,11 +30377,15 @@ async function _deleteAndReplacePick(sym) {
   const card = document.querySelector(`.picker-card[data-sym="${CSS.escape(norm)}"]`);
   if (card) { card.style.opacity = '.5'; const db = card.querySelector('.picker-del-btn'); if (db) { db.disabled = true; db.textContent = '…'; } }
 
-  // Remove from the cached set + today's journal; remember it as excluded.
-  cached.picks.splice(idx, 1);
-  if (cached.rationales) delete cached.rationales[norm];
-  cached.excluded = Array.from(new Set([...(cached.excluded || []), norm]));
-  _removeFromTodayJournal(norm);
+  // Remove from the cached set + today's journal; remember it as excluded. Use
+  // the pure helper so the cache + journal day are mutated identically (and a
+  // watched pick's tracking is dropped too — removing is the explicit "drop this",
+  // unlike [+ Watch] which keeps tracking). The journal day object is mutated in
+  // place; save() below persists it.
+  const _todayKey = _localDateKey(new Date());
+  const _dayEntry = (S.pickerJournal || {})[_todayKey] || null;
+  _pickerRemoveSync(cached, _dayEntry, norm);
+  save();
   _pickerWriteCache(PICKER_CACHE_KEY, cached);
 
   // Exclusion set = remaining picks + everything excluded this rotation.
@@ -30288,10 +30452,33 @@ function gradePickerJournal() {
         const dirActual = movePct > threshold ? 'bull' : movePct < -threshold ? 'bear' : 'neutral';
         const correct = dirActual === tick.direction;
 
-        // SPY move over same window
+        // SPY move over same window — KEPT BYTE-FOR-BYTE (legacy primary; zero
+        // drift). bench.SPY is set from these exact values below.
         const spyEntry = S.dailyPriceLog[dateKey]?.['SPY'] || null;
         const spyClose = logAtTarget?.['SPY'] || null;
         const spyMovePct = (spyEntry && spyClose) ? ((spyClose - spyEntry) / spyEntry * 100) : null;
+
+        // Multi-index benchmarking (HLD-B): grade vs each PICKER_BENCHMARKS index
+        // over the same [day, day+horizon] window. SPY reuses the legacy values
+        // above (no recompute → zero drift); other indices use the null-safe
+        // _getDailyPrice path. A missing index day-key (e.g. legacy pre-upgrade
+        // days have no QQQ) yields a null bench entry that renders "—".
+        const bench = {};
+        for (const b of PICKER_BENCHMARKS) {
+          if (b === 'SPY') {
+            // BYTE-FOR-BYTE alias of the legacy spyMovePct / vs_spy — zero drift.
+            bench.SPY = (spyMovePct != null)
+              ? { movePct: +spyMovePct.toFixed(2), vs: +(movePct - spyMovePct).toFixed(2) }
+              : null;
+            continue;
+          }
+          const bEntry = S.dailyPriceLog[dateKey]?.[b] ?? _getDailyPrice(b, dateKey, 0);
+          const bClose = logAtTarget?.[b] ?? _getDailyPrice(b, dateKey, horizonDays);
+          const bMove = (bEntry > 0 && bClose > 0) ? ((bClose - bEntry) / bEntry * 100) : null;
+          bench[b] = (bMove != null)
+            ? { movePct: +bMove.toFixed(2), vs: +(movePct - bMove).toFixed(2) }
+            : null;
+        }
 
         entry.grades[tick.sym] = {
           graded:     true,
@@ -30299,6 +30486,7 @@ function gradePickerJournal() {
           movePct:    +movePct.toFixed(2),
           spyMovePct: spyMovePct != null ? +spyMovePct.toFixed(2) : null,
           vs_spy:     spyMovePct != null ? +(movePct - spyMovePct).toFixed(2) : null,
+          bench,
           gradedAt:   new Date().toISOString(),
         };
         totalGraded++;
@@ -31215,12 +31403,19 @@ async function refreshPickerIfStale(force = false) {
     const rationales = {};
     for (const p of picks) rationales[p.sym] = p.rationale;
 
-    // Anchor the SPY benchmark at pick time for since-pick alpha.
+    // Anchor each benchmark (SPY + QQQ) at pick time for since-pick alpha. Keep
+    // `spyEntry` too (back-compat alias of benchEntry.SPY: the card path + legacy
+    // readers keep working). One fetch covers every PICKER_BENCHMARKS symbol.
+    const benchEntry = {};
     let spyEntry = null;
-    try { const s = await fetchPeerSnapshot(['SPY']); spyEntry = (s.SPY && s.SPY.price) || null; } catch (_) {}
+    try {
+      const s = await _pickerFetchSnapshot(PICKER_BENCHMARKS);
+      for (const b of PICKER_BENCHMARKS) benchEntry[b] = (s[b] && s[b].price > 0) ? s[b].price : null;
+      spyEntry = benchEntry.SPY;
+    } catch (_) {}
 
     _appendPickerJournalEntry(picks);
-    const payload = { ts: Date.now(), picks, rationales, spyEntry, excluded: [] };
+    const payload = { ts: Date.now(), picks, rationales, spyEntry, benchEntry, excluded: [] };
     _pickerWriteCache(PICKER_CACHE_KEY, payload);
     renderPickerCard(picks, rationales);
   } catch (e) {
@@ -31255,7 +31450,7 @@ function _ensurePickerSection() {
         <summary>Track Record</summary>
         <div class="picker-stats-row" id="picker-stats-row"></div>
         <table class="picker-history-table">
-          <thead><tr><th>Date</th><th>Ticker</th><th>Dir</th><th>Conf</th><th>Move%</th><th>vs SPY</th><th>Result</th></tr></thead>
+          <thead><tr><th>Date</th><th>Ticker</th><th>Dir</th><th>Move%</th><th>vs SPY · QQQ</th><th>Result</th></tr></thead>
           <tbody id="picker-history-tbody"></tbody>
         </table>
         <div id="picker-calibration-chart" class="picker-calibration-chart"></div>
@@ -31399,33 +31594,74 @@ function renderPickerTrackRecord() {
 
   const st = getPickerStats();
 
+  // Live track-record rows (pending + graded), windowed to the display window
+  // (entry+horizon+trail). Aggregate stats below stay graded-cumulative — only the
+  // per-pick live row drops past its window (HLD-A G1/G2). The renderer owns the
+  // current-price fallback chain (stockCache → peer cache → picker cache →
+  // dailyPriceLog at the pick day); pickerTrackRows stays pure.
+  const peerCache = _pickerReadCache(PICKER_PEER_CACHE_KEY) || {};
+  const pickerCache = _pickerReadCache(PICKER_CACHE_KEY) || {};
+  const pickerCurMap = {};
+  for (const p of (pickerCache.picks || [])) if (p && p.sym) pickerCurMap[String(p.sym).toUpperCase()] = p;
+  const priceLookup = (sym) => {
+    const s = String(sym).toUpperCase();
+    const sc = (typeof stockCache !== 'undefined' && stockCache) ? stockCache[s] : null;
+    let px = sc ? _parseStockField(sc.price) : null;
+    if (px == null && peerCache[s] && peerCache[s].price > 0) px = peerCache[s].price;
+    if (px == null && pickerCurMap[s] && pickerCurMap[s].curPrice > 0) px = pickerCurMap[s].curPrice;
+    return (px != null && px > 0) ? px : null;
+  };
+  const trackRows = pickerTrackRows(Date.now(), S.pickerJournal, priceLookup, {});
+  const pendingCount = trackRows.filter(r => r.status === 'pending').length;
+
   if (statsEl) {
     const fmt = (v, suf = '') => v != null ? `${v >= 0 ? '+' : ''}${typeof v === 'number' ? v.toFixed(1) : v}${suf}` : '--';
     statsEl.innerHTML = `
       <span>Directional accuracy</span><strong>${st.directionalAccuracy != null ? (st.directionalAccuracy * 100).toFixed(0) + '%' : '--'}</strong>
       <span>vs SPY alpha</span><strong>${st.vsSpyAlpha != null ? fmt(st.vsSpyAlpha, '%') : '--'}</strong>
       <span>Avg return (correct)</span><strong>${st.avgReturnOnCorrect != null ? '+' + st.avgReturnOnCorrect.toFixed(1) + '%' : '--'}</strong>
-      <span>Graded picks</span><strong>${st.N}</strong>`;
+      <span>Graded picks</span><strong>${st.N}${pendingCount ? ` <span style="color:var(--muted);font-weight:400">(${pendingCount} pending)</span>` : ''}</strong>`;
   }
 
   if (tbodyEl) {
-    const G = _pickerAllGraded().slice(-10).reverse();
-    if (!G.length) {
-      tbodyEl.innerHTML = '<tr><td colspan="7" style="text-align:center;color:var(--muted)">No graded picks yet ⏳</td></tr>';
+    if (!trackRows.length) {
+      tbodyEl.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--muted)">No picks in window yet ⏳</td></tr>';
     } else {
-      tbodyEl.innerHTML = G.map(g => {
-        const grade = g.grade;
-        const resCls = grade.correct ? 'picker-grade-correct' : 'picker-grade-wrong';
-        const resLabel = grade.correct ? '✓' : '✗';
-        const dateFmt = g.dateKey ? `${g.dateKey.slice(4,6)}/${g.dateKey.slice(6,8)}` : '--';
-        return `<tr>
+      // newest first; cap the live list to a reasonable length.
+      const rows = trackRows.slice(0, 15);
+      const benchCell = (bench) => {
+        if (!bench) return '<span style="color:var(--muted)">—</span>';
+        const part = (b) => {
+          const v = bench[b];
+          if (!v || v.vs == null) return '—';
+          const cls = v.vs >= 0 ? 'up' : 'down';
+          return `<span class="${cls}">${v.vs >= 0 ? '+' : ''}${v.vs.toFixed(1)}%</span>`;
+        };
+        return `${part('SPY')} · ${part('QQQ')}`;
+      };
+      tbodyEl.innerHTML = rows.map(r => {
+        const dateFmt = r.date ? `${r.date.slice(4,6)}/${r.date.slice(6,8)}` : '--';
+        const dirCls = r.direction === 'bull' ? 'up' : 'down';
+        const dirGlyph = r.direction === 'bull' ? '▲' : '▼';
+        const moveStr = r.movePct != null ? `${r.movePct >= 0 ? '+' : ''}${r.movePct.toFixed(1)}%` : '--';
+        const moveCls = (r.movePct || 0) >= 0 ? 'up' : 'down';
+        let resHtml;
+        if (r.status === 'pending') {
+          const otCls = r.onTrack == null ? '' : (r.onTrack ? 'picker-grade-correct' : 'picker-grade-wrong');
+          const otTxt = r.onTrack == null ? 'pending' : (r.onTrack ? 'on-track' : 'off-track');
+          resHtml = `<span class="${otCls}" style="font-size:10px">${otTxt} • ${r.daysRemaining}d left</span>`;
+        } else {
+          const resCls = r.correct ? 'picker-grade-correct' : 'picker-grade-wrong';
+          resHtml = `<span class="${resCls}">${r.correct ? '✓' : '✗'}</span>`;
+        }
+        const watchTag = r.watched ? ' <span style="color:var(--muted);font-size:9px">✓watch</span>' : '';
+        return `<tr${r.status === 'pending' ? ' style="opacity:.85"' : ''}>
           <td>${dateFmt}</td>
-          <td>${g.sym}</td>
-          <td class="${g.direction === 'bull' ? 'up' : 'down'}">${g.direction === 'bull' ? '▲' : '▼'}</td>
-          <td>${(g.confidence * 100).toFixed(0)}%</td>
-          <td class="${(grade.movePct || 0) >= 0 ? 'up' : 'down'}">${grade.movePct != null ? (grade.movePct >= 0 ? '+' : '') + grade.movePct.toFixed(1) + '%' : '--'}</td>
-          <td class="${(grade.vs_spy || 0) >= 0 ? 'up' : 'down'}">${grade.vs_spy != null ? (grade.vs_spy >= 0 ? '+' : '') + grade.vs_spy.toFixed(1) + '%' : '--'}</td>
-          <td class="${resCls}">${resLabel}</td>
+          <td>${r.sym}${watchTag}</td>
+          <td class="${dirCls}">${dirGlyph}</td>
+          <td class="${moveCls}">${moveStr}</td>
+          <td>${benchCell(r.bench)}</td>
+          <td>${resHtml}</td>
         </tr>`;
       }).join('');
     }
@@ -31470,19 +31706,40 @@ function onPickerRefreshClick(event) {
   refreshPickerIfStale(true);
 }
 
-// [+ Watch] on a picker card → add to watchlist, invalidate the picker cache,
-// and re-run selection so the now-watched ticker is excluded from future picks
-// (two-layer exclusion + DOMContentLoaded stale-cache guard already exist).
+// [+ Watch] on a picker card → add to watchlist BUT keep tracking the pick
+// (HLD-A G4). We mark the pick `watched:true` in the cache IN PLACE and keep its
+// journal entry, so grading + the track record continue. We do NOT purge the
+// cache or force a full regen (that would drop the just-promoted pick). New
+// selection still excludes the whole watchlist (two-layer exclusion), so we never
+// RE-pick a watchlist name — we only continue an existing one. The boot guard is
+// exempted for watched picks so the promoted pick survives a reload.
 function _watchFromPick(sym) {
   const norm = String(sym || '').trim().toUpperCase();
   if (!norm) return;
   addStockSym(norm);
-  // Optimistic UI: flip this card's button to a disabled "✓" until the picker
-  // re-render replaces the card set.
+  // Optimistic UI: flip this card's button to a disabled "✓ Watching".
   const btn = document.querySelector(`.picker-watch-btn[data-sym="${CSS.escape(norm)}"]`);
-  if (btn) { btn.disabled = true; btn.textContent = '✓'; btn.title = `${norm} added to your watchlist`; }
-  try { localStorage.removeItem(PICKER_CACHE_KEY); } catch(_) {}
-  try { refreshPickerIfStale(true); } catch(_) {}
+  if (btn) { btn.disabled = true; btn.textContent = '✓'; btn.title = `${norm} added to your watchlist (still tracking)`; }
+  // Mark the pick watched in place (do NOT purge / regen / drop the journal).
+  try {
+    const cached = _pickerReadCache(PICKER_CACHE_KEY);
+    if (cached && Array.isArray(cached.picks)) {
+      const p = cached.picks.find(x => String(x.sym).toUpperCase() === norm);
+      if (p) { p.watched = true; _pickerWriteCache(PICKER_CACHE_KEY, cached); }
+    }
+  } catch(_) {}
+  // Also flag the journal ticker so the track record can render the watch state.
+  try {
+    const key = _localDateKey(new Date());
+    const e = (S.pickerJournal || {})[key];
+    if (e && Array.isArray(e.tickers)) {
+      const t = e.tickers.find(x => String(x.sym).toUpperCase() === norm);
+      if (t) { t.watched = true; save(); }
+    }
+  } catch(_) {}
+  // Targeted re-render only — keep the pick visible as "✓ Watching".
+  try { const c = _pickerReadCache(PICKER_CACHE_KEY); if (c) renderPickerCard(c.picks, c.rationales); } catch(_) {}
+  try { renderPickerTrackRecord(); } catch(_) {}
 }
 // Delegated listener for the picker card [+ Watch] buttons (no inline onclick).
 document.addEventListener('click', (e) => {
@@ -31519,14 +31776,26 @@ function onPickerSettingsChange(key, val) {
 // MAI serves from cache on most page loads and returns early, never calling
 // refreshPickerIfStale(). So we call it ourselves at DOMContentLoaded.
 document.addEventListener('DOMContentLoaded', function() {
+  // One-time numPicks 3→5 migration (HLD-A G3): bump an existing install to the
+  // new default ONCE, without ever overriding a deliberate future choice. The
+  // flag makes it idempotent; the user can always change numPicks back in
+  // settings (the flag is set regardless, so we never re-bump).
+  try {
+    const hadFlag = !!localStorage.getItem('sp_picker_5pick_mig');
+    if (!S.pickerSettings || typeof S.pickerSettings !== 'object') S.pickerSettings = {};
+    const mig = _pickerMigrateNumPicks(S.pickerSettings, hadFlag);
+    if (mig.changed) save();
+    if (mig.setFlag) localStorage.setItem('sp_picker_5pick_mig', '1');
+  } catch(_) {}
   // Invalidate any picker cache that predates the universe redesign
   // (those picks contained watchlist stocks — detect by checking if any pick
-  //  is in the current watchlist)
+  //  is in the current watchlist). EXEMPT picks intentionally promoted to the
+  //  watchlist (watched:true) so they survive a reload (HLD-A G4).
   try {
     const pc = JSON.parse(localStorage.getItem(PICKER_CACHE_KEY) || 'null');
     if (pc && pc.picks && pc.picks.length) {
       const wl = new Set((S.stocks || []).map(s => String(s).toUpperCase()));
-      const hasWatchlistStock = pc.picks.some(p => wl.has(String(p.sym || '').toUpperCase()));
+      const hasWatchlistStock = pc.picks.some(p => wl.has(String(p.sym || '').toUpperCase()) && !p.watched);
       if (hasWatchlistStock) {
         localStorage.removeItem(PICKER_CACHE_KEY);
         localStorage.removeItem(PICKER_RATIONALE_CACHE_KEY);
@@ -31544,6 +31813,9 @@ document.addEventListener('DOMContentLoaded', function() {
 
 window.refreshPickerIfStale = refreshPickerIfStale;
 window.gradePickerJournal   = gradePickerJournal;
+window.pickerTrackRows      = pickerTrackRows;
+window.renderPickerTrackRecord = renderPickerTrackRecord;
+window._pickerMigrateNumPicks  = _pickerMigrateNumPicks;
 
 // ===== ZONE: STOCK-PICKER — END =====
 
