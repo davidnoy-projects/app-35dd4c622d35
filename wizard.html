@@ -279,14 +279,28 @@ const TESTS = {
       return { ok:false, detail: k==='timeout' ? 'Timed out reaching the relay.' : 'Couldn’t reach that address.',
         fix:'Double-check the full https://…workers.dev address, and that you clicked Deploy (a saved-but-not-deployed worker won’t answer).' };
     }
+    // Confirm it's OUR relay and its safety/proxy logic is intact, WITHOUT depending on
+    // Yahoo serving data: our worker refuses any non-allowlisted host with a 403. A 2xx
+    // for a disallowed host means it's the wrong/sample code, not ours. This — together
+    // with the /ping=pong check above — is the TRUE "is the relay set up" signal.
+    try {
+      const g = await tfetch(base + '/?url=' + encodeURIComponent('https://example.com/'), {}, 10000);
+      if (g.ok) return { ok:false, detail:'The address answers but doesn’t enforce our relay’s safety rules — it looks like the wrong code, not ours.', fix:'Open the “Worker code” box above, click Copy, paste it over EVERYTHING in Cloudflare’s editor (Ctrl/Cmd+A first), and Deploy.' };
+    } catch(e){ /* non-blocking: /ping already proved reachability + our code */ }
+
+    // SOFT live-data probe. A failure here is almost always Yahoo rate-limiting a brand-
+    // new worker — NOT a setup problem — so it NEVER fails the check; it only makes the
+    // message more specific. Only a 5xx (a worker exception → incomplete paste) is a real
+    // relay error. This is the fix for the false "Relay returned something unexpected".
     try {
       const r = await tfetch(base + '/?url=' + encodeURIComponent('https://query1.finance.yahoo.com/v8/finance/spark?symbols=AAPL&range=1d&interval=1d'), {}, 12000);
-      if (r.status === 403) return { ok:false, detail:'The relay is up but rejected the request (403) — this looks like Cloudflare’s default sample code, not ours.', fix:'Scroll up to the “Worker code” box here, click Copy, paste it over everything in Cloudflare’s editor, and Deploy again.' };
-      if (!r.ok) return { ok:false, detail:'Relay is up, but a test data request failed ('+r.status+').', fix:'Click Deploy again; if it keeps failing, re-copy the worker code.' };
-      const j = await r.json().catch(()=>null);
-      if (!j || !j.spark) return { ok:false, detail:'Relay returned something unexpected.', fix:'Re-copy the worker code above and Deploy again.' };
-    } catch(e){ return { ok:false, detail:'Relay is up but the test data request failed.', fix:'Re-copy the worker code and Deploy again.' }; }
-    return { ok:true, detail:'Relay is working — live data will flow through it.', fix:null };
+      if (r.status >= 500) return { ok:false, detail:'The relay hit an internal error — the Worker code looks incomplete.', fix:'Re-copy the FULL Worker code above (Ctrl/Cmd+A, then Copy) and Deploy again.' };
+      if (r.ok) {
+        const j = await r.json().catch(()=>null);
+        if (j && j.spark) return { ok:true, detail:'Relay is working — live data is flowing through it.', fix:null };
+      }
+    } catch(e){ /* fall through to the "set up, upstream temporarily limited" message */ }
+    return { ok:true, detail:'Relay is set up correctly. Yahoo didn’t return live data on this check — a temporary upstream limit (common right after deploying), not your relay. The dashboard keeps retrying, so prices will appear shortly.', fix:null };
   },
 
   groqApiKey(k){ return _testLLM('groq', k); },

@@ -964,10 +964,18 @@
       align-items: center;
       gap: 6px;
       white-space: nowrap;
+      /* Let the title shrink and truncate (the refresh timestamp / accuracy
+         badge are the first to clip) instead of pushing the action buttons off
+         the widget's right edge, where .widget{overflow:hidden} would hide them
+         (settings/add/refresh went missing on a narrow column). */
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
-    .wtitle svg { stroke: var(--primary); filter: drop-shadow(0 0 4px var(--primary-glow)); }
-    /* wmeta sits between title and wactions; wactions is pushed to the far right */
-    .wactions { display: flex; gap: 3px; margin-left: auto; }
+    .wtitle svg { stroke: var(--primary); filter: drop-shadow(0 0 4px var(--primary-glow)); flex-shrink: 0; }
+    /* wmeta sits between title and wactions; wactions is pushed to the far right
+       and must never be clipped — the header buttons are the priority. */
+    .wactions { display: flex; gap: 3px; margin-left: auto; flex-shrink: 0; }
 
     /* Drag handle injected into every widget header. Only this element is
        draggable=true, so the rest of the widget (inputs, buttons, scrollable
@@ -5791,20 +5799,44 @@ function _mergeDailyPriceLog(incoming) {
 // image and manual weather location, and the day-keyed data stores via the
 // local-wins merges above. All three apply paths MUST go through this so
 // "re-applying a config" can never clobber picks, trackers, or journals.
-function _mergeLocalPreserves(merged, candidate) {
+// `localState` defaults to the live S; tests pass a literal local state.
+// opts.appearanceLocalWins=true (the SYNC PULL) keeps this device's look; the
+// default (explicit file IMPORT / Undo) lets the incoming values win so a restore
+// actually restores. `localState` defaults to the live S; tests pass a literal.
+function _mergeLocalPreserves(merged, candidate, localState, opts) {
+  const L = (localState !== undefined ? localState : (typeof S !== 'undefined' ? S : null)) || {};
+  const o = opts || {};
+  // LOCAL-BASE OVERLAY: start from the CURRENT local state and let the incoming
+  // config overwrite ONLY the fields it actually carries. This is the core fix for
+  // "a pull loses my settings": a stale copy that lacks newer fields (e.g.
+  // widgetBgAlpha, or any setting added since that copy was written) no longer resets
+  // them to DEFAULTS — the local value survives. Fields the incoming copy DOES carry
+  // still win, so an explicit import/restore applies, and multi-device sync of shared
+  // settings is unchanged.
+  merged = Object.assign({}, L, merged);
+
   const SECRET_PRESERVE = ['stockApiKey','stockProxyUrl','groqApiKey','geminiApiKey',
     'mistralApiKey','gcalOauthClientId','fredApiKey','eiaApiKey','quiverApiKey',
     'yahooCookies','icsUrl'];
-  for (const k of SECRET_PRESERVE) if (!merged[k] && S?.[k]) merged[k] = S[k];
-  if (!merged.bgImageUrl && S?.bgImageUrl) {
-    merged.bgImageUrl = S.bgImageUrl;
-    if (merged.bgImageOpacity == null && S.bgImageOpacity != null) merged.bgImageOpacity = S.bgImageOpacity;
-    if (merged.bgImageDim     == null && S.bgImageDim     != null) merged.bgImageDim     = S.bgImageDim;
+  for (const k of SECRET_PRESERVE) if (!merged[k] && L[k]) merged[k] = L[k];
+
+  // Background IMAGE url: cloud wins if it carries one, else keep local (large, and
+  // an empty cloud value must not wipe a locally-set wallpaper).
+  if (!merged.bgImageUrl && L.bgImageUrl) merged.bgImageUrl = L.bgImageUrl;
+  // Appearance preferences (opacity / dim / widget glass). On a SYNC PULL keep THIS
+  // device's look (local wins) — a pull must never revert it. On an explicit file
+  // IMPORT or Undo the incoming values WIN so a restore actually restores them (the
+  // local-base overlay above already preserves them when the incoming copy lacks them).
+  if (o.appearanceLocalWins) {
+    if (L.bgImageOpacity != null) merged.bgImageOpacity = L.bgImageOpacity;
+    if (L.bgImageDim     != null) merged.bgImageDim     = L.bgImageDim;
+    if (L.widgetBgAlpha  != null) merged.widgetBgAlpha  = L.widgetBgAlpha;
   }
+
   merged.maiJournal    = _mergeMaiJournal(candidate.maiJournal);
   merged.pickerJournal = _mergePickerJournal(candidate.pickerJournal);
   merged.dailyPriceLog = _mergeDailyPriceLog(candidate.dailyPriceLog);
-  if (!merged.weatherLocation && S?.weatherLocation) merged.weatherLocation = S.weatherLocation;
+  if (!merged.weatherLocation && L.weatherLocation) merged.weatherLocation = L.weatherLocation;
   return merged;
 }
 
@@ -7389,7 +7421,9 @@ async function ghPull() {
     // background image, manual weather location, and merge the day-keyed
     // data stores (journals + price log) with local-wins semantics — a stale
     // cloud copy can't clobber picks, trackers, journals, or grading data.
-    const merged = _mergeLocalPreserves(Object.assign({}, candidate), candidate);
+    // Sync pull: keep THIS device's appearance (a pull must not revert opacity/dim/
+    // glass). File Import + Undo use the default (incoming wins) so a restore restores.
+    const merged = _mergeLocalPreserves(Object.assign({}, candidate), candidate, undefined, { appearanceLocalWins: true });
     S = normalizeImportedState(merged);
     save({ mirror: true });  // major mutation — force the recovery mirror current
     _applyOutOfBandKeys(parsed); // theme, widgetLayout, caches; flight/hotel trackers MERGE into local
@@ -10265,7 +10299,21 @@ async function fetchYahooBatch(syms) {
 // (worker passes through with a browser UA → crumb usually unnecessary),
 // then fall through to crumb-based CORS attempts. Returns {} on any failure
 // — the badge just won't render.
+// Public entry: chunk into ≤20-symbol requests (Yahoo's /finance/quote cap is
+// the same 20 as spark — a 21+ request 400s and the badges silently vanish) and
+// merge whatever each chunk returns.
 async function fetchYahooExtBatch(symbols) {
+  const list = (symbols || []).filter(Boolean);
+  if (!list.length) return {};
+  const chunks = [];
+  for (let i = 0; i < list.length; i += YAHOO_SPARK_MAX) chunks.push(list.slice(i, i + YAHOO_SPARK_MAX));
+  const results = await Promise.all(chunks.map(_fetchYahooExtChunk));
+  const merged = {};
+  for (const r of results) Object.assign(merged, r);
+  return merged;
+}
+
+async function _fetchYahooExtChunk(symbols) {
   if (!symbols?.length) return {};
   const syms = symbols.join(',');
   const parse = (data) => {
@@ -10395,11 +10443,20 @@ function parseSpark(data) {
   return out;
 }
 
-async function fetchYahooSparkBatch(symbols) {
-  const list = (symbols || []).filter(sym => sym && !/^[A-Z]{5}X$/i.test(sym));
+// Yahoo's spark endpoint hard-caps a single request at 20 symbols — a request
+// for 21+ returns HTTP 400 ("Number of symbols needs to be less than or equal
+// to 20") which fails the WHOLE batch, so a 21+ symbol watchlist left every
+// quote stuck on "·refreshing" (parseSpark threw → empty → nothing merged →
+// quoteAt never re-stamped). We therefore split into ≤20-symbol chunks and
+// merge, so one oversized list (or one bad chunk) can't sink the rest.
+const YAHOO_SPARK_MAX = 20;
+
+// Fetch ONE chunk (≤20 symbols) through the proxy / fallback chain. Returns the
+// parsed per-symbol map, or {} if every attempt failed (never throws).
+async function _fetchYahooSparkChunk(list) {
   if (!list.length) return {};
   const syms = list.join(',');
-  console.log(`[Stock-Spark] Fetching batch for: ${syms}`);
+  console.log(`[Stock-Spark] Fetching chunk for: ${syms}`);
 
   const src = `https://query2.finance.yahoo.com/v7/finance/spark?symbols=${encodeURIComponent(syms)}&range=1d&interval=5m`;
 
@@ -10422,10 +10479,26 @@ async function fetchYahooSparkBatch(symbols) {
     console.log(`[Stock-Spark] Got ${Object.keys(result).length} symbols`);
     return result;
   } catch(e) {
-    console.log('[Stock-Spark] All attempts failed');
-    _maybeProxyBrokenToast();
+    console.log('[Stock-Spark] Chunk attempts failed');
     return {};
   }
+}
+
+// Public entry: chunk into ≤20-symbol requests (Yahoo's limit) and merge. A
+// partial failure (one dead chunk) still returns whatever the others fetched.
+async function fetchYahooSparkBatch(symbols) {
+  const list = (symbols || []).filter(sym => sym && !/^[A-Z]{5}X$/i.test(sym));
+  if (!list.length) return {};
+  const chunks = [];
+  for (let i = 0; i < list.length; i += YAHOO_SPARK_MAX) chunks.push(list.slice(i, i + YAHOO_SPARK_MAX));
+  const results = await Promise.all(chunks.map(_fetchYahooSparkChunk));
+  const merged = {};
+  for (const r of results) Object.assign(merged, r);
+  if (!Object.keys(merged).length) {
+    console.log('[Stock-Spark] All chunks failed');
+    _maybeProxyBrokenToast();
+  }
+  return merged;
 }
 
 // ── Tier 1: per-symbol Yahoo Finance chart API, racing all proxy×host combos ─
@@ -10754,6 +10827,19 @@ function _quoteAsOf(d) {
     return new Date(d.quoteAt).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false });
   } catch (_) { return ''; }
 }
+
+// Read-only test seam (behavior-neutral). `stockCache` and `S` are lexical
+// top-level bindings invisible to the node:vm harness; this exposes live refs so
+// test/freshness.test.js can drive the REAL fetch→merge→freshness chain and
+// inspect the resulting cache. Guarded so it never throws on odd hosts.
+try {
+  if (typeof window !== 'undefined') {
+    window._stockTestHooks = {
+      cache: () => stockCache,
+      state: () => S,
+    };
+  }
+} catch (_) {}
 
 function normalizedDelta(d = {}) {
   const p = Number(d.price);
@@ -14580,9 +14666,50 @@ function toggleUnit() {
 ════════════════════════════════════════════ */
 const MAI_CACHE_KEY = 'sp_market_ai_cache';
 const MAI_TTL_MS    = 20 * 60 * 1000;         // 20 min — throttles refreshes
-const MAI_MAX_TICKERS   = 12;                  // cap to keep prompts small
+const MAI_MAX_TICKERS   = 12;                  // per-RUN cap to keep prompts small
 const MAI_HEADLINES_PER = 3;                   // per ticker
 const MAI_COLLAPSED_KEY = 'sp_mai_collapsed';
+const MAI_ROTATE_KEY    = 'sp_mai_rotate';    // rotation offset when watchlist > cap
+const MAI_CARRY_MAX_MS  = 24 * 3600 * 1000;   // carried predictions expire after 24h
+
+// ── Rotating coverage window ─────────────────────────────────────────────────
+// With more than MAI_MAX_TICKERS on the watchlist, a fixed `.slice(0, cap)`
+// permanently starved every ticker after the first 12 — newly added tickers
+// NEVER got predictions. Instead each run covers the next window of the list
+// (offset persisted in MAI_ROTATE_KEY), so consecutive refreshes sweep the whole
+// watchlist; predictions for tickers outside the current window are carried
+// forward from the cache (below) so their icons don't vanish between sweeps.
+// Pure + top-level for the test harness: takes everything as arguments.
+function _maiRotateWindow(userTickers, offset, cap) {
+  const list = (Array.isArray(userTickers) ? userTickers : []).filter(Boolean);
+  const n = list.length;
+  const c = Math.max(1, cap | 0);
+  if (n <= c) return { tickers: list.slice(), nextOffset: 0 };
+  const off = ((offset | 0) % n + n) % n;
+  const rotated = list.slice(off).concat(list.slice(0, off));
+  return { tickers: rotated.slice(0, c), nextOffset: (off + c) % n };
+}
+
+// Carry forward cached predictions for user tickers NOT covered by this run.
+// Skips tickers already predicted this run, tickers no longer on the watchlist,
+// and anything older than maxAgeMs (stale carries must expire, not linger).
+// Marks carried rows so the journal recorder can skip them (they were recorded
+// on the day they were actually predicted — re-recording would fake history).
+function _maiCarryForward(freshPredictions, cachedPredictions, cachedTs, userTickers, maxAgeMs, nowMs) {
+  const fresh = new Set((freshPredictions || []).map(p => p && p.ticker).filter(Boolean));
+  const users = new Set((userTickers || []).map(s => String(s || '').toUpperCase()).filter(Boolean));
+  const now = Number.isFinite(nowMs) ? nowMs : Date.now();
+  const out = [];
+  for (const p of (cachedPredictions || [])) {
+    if (!p || !p.ticker) continue;
+    if (fresh.has(p.ticker)) continue;
+    if (!users.has(String(p.ticker).toUpperCase())) continue;
+    const born = Number.isFinite(p.carriedTs) ? p.carriedTs : (Number.isFinite(cachedTs) ? cachedTs : now);
+    if (now - born > (Number.isFinite(maxAgeMs) ? maxAgeMs : MAI_CARRY_MAX_MS)) continue;
+    out.push(Object.assign({}, p, { carried: true, carriedTs: born }));
+  }
+  return out;
+}
 
 let _maiInFlight = false;
 let _maiAbort    = null;
@@ -17667,6 +17794,42 @@ async function _aiFetch(provider, upstreamUrl, opts, opts2 = {}) {
   };
 }
 
+// ── Groq free-tier rate-limit planner ────────────────────────────────────────
+// Groq counts (prompt tokens + max_tokens) against a PER-MODEL tokens-per-minute
+// budget and rejects with 429 ("Limit L, Used U, Requested R. Please try again
+// in Xs") or 413 ("Request too large… Limit L, Requested R"). Our fixed
+// max_tokens: 4096 was most of the overshoot — the JSON output for a 12-ticker
+// run needs ~1.5k. Given the error text, decide how to make the request FIT:
+//   • retry — the request fits with a smaller completion budget (and, for 429,
+//     after Groq's own suggested wait): newMaxTokens = L − promptTokens − U − margin.
+//   • next  — the prompt alone can't fit this model's budget; move to the next
+//     model in the chain (each Groq model has its OWN per-minute bucket).
+//   • other — not a rate-limit shape we handle.
+// Pure + top-level so the harness can test it against real captured errors.
+function _groqRateLimitPlan(status, errText, sentMaxTokens) {
+  if (status !== 429 && status !== 413) return { kind: 'other' };
+  const t = String(errText || '');
+  const num = (re) => { const m = t.match(re); return m ? parseFloat(m[1]) : null; };
+  const limit     = num(/Limit\s+([\d.]+)/i);
+  const used      = num(/Used\s+([\d.]+)/i) || 0;
+  const requested = num(/Requested\s+([\d.]+)/i);
+  const waitS     = num(/try again in\s+([\d.]+)\s*m?s/i);
+  const maxSent   = Number.isFinite(sentMaxTokens) ? sentMaxTokens : 4096;
+  const waitMs    = status === 429 ? Math.min(((waitS || 4) + 0.5) * 1000, 10_000) : 0;
+  if (limit == null || requested == null) {
+    // Unparseable limits: a 429 is still worth one same-budget retry after a
+    // short wait (transient concurrent usage); a 413 is not (size won't change).
+    return status === 429 ? { kind: 'retry', waitMs, newMaxTokens: maxSent } : { kind: 'next' };
+  }
+  const promptTokens = Math.max(0, requested - maxSent);
+  const MARGIN = 256, MIN_OUT = 768;
+  const fit = Math.floor(limit - promptTokens - used - MARGIN);
+  if (fit >= MIN_OUT) {
+    return { kind: 'retry', waitMs, newMaxTokens: Math.min(maxSent, Math.max(MIN_OUT, fit)) };
+  }
+  return { kind: 'next' };
+}
+
 async function queryGroq(prompt, signal) {
   const key = (S.groqApiKey || '').trim();
   if (!key) return null;
@@ -17749,12 +17912,48 @@ async function queryGroq(prompt, signal) {
         console.warn(`[Groq] Model ${model} 400:`, txt);
         continue;       // model-specific issue — try next
       }
-      const text = (await r.text()).slice(0, 300);
+      const text = (await r.text()).slice(0, 400);
       lastErr = `HTTP ${r.status} · ${text}`;
       console.warn(`[Groq] Model ${model} failed:`, r.status, text);
-      // Deprecated model → try next. Auth/quota errors → stop.
+      // Deprecated model → try next. Auth errors → stop.
       if (r.status === 401 || r.status === 403) break;
-      if (r.status === 429) break;
+      // Free-tier TPM rate limits (429/413): Groq counts prompt + max_tokens
+      // against a PER-MODEL per-minute budget. Ask the planner whether the
+      // request fits with a smaller completion budget (retrying after Groq's
+      // own suggested wait), else fall through to the next model — each model
+      // has its own TPM bucket, so the chain often still succeeds.
+      if (r.status === 429 || r.status === 413) {
+        const plan = _groqRateLimitPlan(r.status, text, body.max_tokens);
+        if (plan.kind === 'retry') {
+          console.warn(`[Groq] ${model} rate-limited — retrying in ${Math.round(plan.waitMs/1000)}s with max_tokens ${plan.newMaxTokens} (was ${body.max_tokens})`);
+          if (plan.waitMs) await new Promise(res => setTimeout(res, plan.waitMs));
+          if (signal?.aborted) break;
+          try {
+            const bodyFit = Object.assign({}, body, { max_tokens: plan.newMaxTokens });
+            const rFit = await _aiFetch('groq', 'https://api.groq.com/openai/v1/chat/completions', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key },
+              body: JSON.stringify(bodyFit),
+              signal,
+            });
+            if (rFit.ok) {
+              _groqWorkingModel = model;
+              const jFit = await rFit.json();
+              const contentFit = jFit?.choices?.[0]?.message?.content || '';
+              const finFit = jFit?.choices?.[0]?.finish_reason;
+              if (finFit && finFit !== 'stop') {
+                console.warn(`[Groq] ${model} (fit retry) finish_reason=${finFit} — output may be truncated (raw length ${contentFit.length})`);
+              }
+              return contentFit;
+            }
+            lastErr = `HTTP ${rFit.status} · ${(await rFit.text()).slice(0, 300)}`;
+            console.warn(`[Groq] ${model} fit-retry failed:`, lastErr);
+          } catch (eFit) {
+            lastErr = eFit.message || String(eFit);
+          }
+        }
+        continue;   // next model — separate per-model TPM bucket
+      }
       if (!/model/i.test(text) && r.status !== 404 && r.status !== 400) break;
     } catch (e) {
       lastErr = e.message || String(e);
@@ -19629,6 +19828,11 @@ function recordMaiJournal(payload) {
       // Skip "insufficient data" entries — recording them would inflate the
       // journal with unscoreable rows and pollute the accuracy badge.
       if (p.noSignal) continue;
+      // Skip rotation carry-forwards — they were journaled on the day they were
+      // actually predicted; re-recording under today would fabricate history
+      // (wrong predKey/baseline) and skew grading. Covers both call sites
+      // (refreshMarketAI and applyMarketAiPayload-on-boot with a cached payload).
+      if (p.carried) continue;
       // Only overwrite if we don't already have a graded entry for today.
       const existing = e.byTicker[p.ticker];
       if (existing && existing.graded != null) continue;
@@ -22556,13 +22760,22 @@ async function refreshMarketAI(force = false) {
   // Futures predict market-wide moves, so we need SPY/QQQ/DIA to properly
   // calibrate futures accuracy. User's stocks come first (up to limit), then
   // we backfill indices if there's room.
+  // When the watchlist exceeds the per-run cap, ROTATE the coverage window
+  // (offset in MAI_ROTATE_KEY) so consecutive refreshes sweep every ticker —
+  // a fixed slice(0, cap) permanently starved everything after the first 12.
   const userTickers = (S.stocks || []).filter(Boolean);
-  const tickersSet = new Set(userTickers.slice(0, MAI_MAX_TICKERS));
+  let rotOffset = 0;
+  try { rotOffset = parseInt(localStorage.getItem(MAI_ROTATE_KEY) || '0', 10) || 0; } catch(_) {}
+  const rot = _maiRotateWindow(userTickers, rotOffset, MAI_MAX_TICKERS);
+  const tickersSet = new Set(rot.tickers);
   for (const idx of MARKET_INDEX_SYMBOLS) {
     if (tickersSet.size >= MAI_MAX_TICKERS) break;
     tickersSet.add(idx);
   }
   const tickers = Array.from(tickersSet);
+  if (userTickers.length > MAI_MAX_TICKERS) {
+    console.log(`[MarketAI] rotation window: ${rot.tickers[0]}…${rot.tickers[rot.tickers.length-1]} (offset ${rotOffset} of ${userTickers.length}; next ${rot.nextOffset})`);
+  }
   if (!tickers.length) { console.log('[MarketAI] no tickers configured'); return; }
 
   _maiInFlight = true;
@@ -22948,9 +23161,35 @@ async function refreshMarketAI(force = false) {
         }
       }
     } catch(_) {}
+    // Journal FIRST, with only this run's fresh predictions — carried rows were
+    // recorded on the day they were actually predicted; re-recording them today
+    // would fabricate history and skew grading.
+    recordMaiJournal(payload);
+
+    // Carry forward cached predictions for user tickers outside this run's
+    // rotation window (age-capped) so their icons/verdicts persist between
+    // sweeps, and merge the per-ticker context maps so deep-dives keep working.
+    try {
+      const carried = _maiCarryForward(payload.predictions, cached?.predictions, cached?.ts, userTickers, MAI_CARRY_MAX_MS);
+      if (carried.length) {
+        payload.predictions = payload.predictions.concat(carried);
+        for (const k of ['headlinesByTicker','optionsByTicker','movingAveragesByTicker',
+                         'enhancedSignalsByTicker','quantBaselineByTicker','perTickerVotes']) {
+          if (cached && cached[k] && typeof cached[k] === 'object')
+            payload[k] = Object.assign({}, cached[k], payload[k] || {});
+        }
+        console.log(`[MarketAI] carried forward ${carried.length} cached prediction(s) for tickers outside this rotation window: ${carried.map(p=>p.ticker).join(', ')}`);
+      }
+    } catch(e) { console.warn('[MarketAI] carry-forward failed (fresh-only payload kept):', e?.message || e); }
+
+    // Advance the rotation offset only after a COMPLETED run, so cache-hit
+    // early-returns and failures don't spin the window without predicting.
+    if (userTickers.length > MAI_MAX_TICKERS) {
+      try { localStorage.setItem(MAI_ROTATE_KEY, String(rot.nextOffset)); } catch(_) {}
+    }
+
     marketAiCacheWrite(payload);
     applyMarketAiPayload(payload);
-    recordMaiJournal(payload);
     try { if (typeof window.refreshPickerIfStale === 'function') window.refreshPickerIfStale(); } catch(_) {}
     // Morning briefing (no-op before 6am, when cached, or when dismissed).
     maybeGenerateBriefing();
