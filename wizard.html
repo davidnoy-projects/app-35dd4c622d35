@@ -144,6 +144,7 @@
       <div class="footer">
         <button class="btn ghost" id="backBtn">← Back</button>
         <div class="right">
+          <button class="btn ghost" id="saveKeysBtn">💾 Save keys file</button>
           <button class="btn ghost" id="skipBtn">Skip</button>
           <button class="btn" id="nextBtn">Next →</button>
         </div>
@@ -473,7 +474,7 @@ function keyField(id, opts){
   wrap.append(label);
   if (opts.hint) wrap.append(el('div', { class:'hint', text: opts.hint }));
   const input = el('input', { type:'password', id:'in-'+id, placeholder: opts.placeholder || 'Paste here', autocomplete:'off', spellcheck:'false', value: cfg[id] || '' });
-  input.addEventListener('input', ()=>{ cfg[id] = input.value; });
+  input.addEventListener('input', ()=>{ cfg[id] = input.value; refreshSaveKeysBtn(); });
   const show = el('button', { class:'iconbtn', type:'button', title:'Show/hide', text:'👁', onclick:()=>{ input.type = input.type==='password'?'text':'password'; } });
   const res = el('div', { class:'result', id:'res-'+id });
   // opts.suppressResult: don't pre-paint the prior ✅ (the Worker badge already shows it —
@@ -534,6 +535,80 @@ function copyButton(getText, labelEl){
   }});
 }
 
+/* ───────────────── keys file (restart insurance) ─────────────────
+   User-held download of the credentials currently in cfg, in the SAME format
+   index.html's QR key-handoff already parses ({kind:'startpage-keys', v:2,
+   keys, gh}) — one keys schema in the ecosystem, zero new index.html code.
+   Save is user-initiated and user-held; nothing here touches
+   sp_wizard_progress (the wizard still NEVER persists secrets itself). */
+const KEYS_FILE_FIELDS = ['stockProxyUrl','groqApiKey','geminiApiKey','mistralApiKey','fredApiKey','eiaApiKey','stockApiKey','gcalOauthClientId','icsUrl'];
+function hasAnyCredential(){
+  return KEYS_FILE_FIELDS.some(f=>(cfg[f]||'').trim()) || !!(cfg.ghPat||'').trim();
+}
+function buildKeysFilePayload(){
+  const payload = { kind:'startpage-keys', v:2, savedAt:new Date().toISOString(), keys:{} };
+  KEYS_FILE_FIELDS.forEach(f=>{ const v=(cfg[f]||'').trim(); if (v) payload.keys[f]=v; });
+  const gh = {};
+  if ((cfg.ghPat||'').trim()) gh.pat = cfg.ghPat.trim();
+  const repo = normRepo(cfg.ghRepo); if (repo) gh.repo = repo;
+  if ((cfg.ghPath||'').trim()) gh.path = cfg.ghPath.trim();
+  if (Object.keys(gh).length) payload.gh = gh;
+  return payload;
+}
+function saveKeysFile(){
+  if (!hasAnyCredential()) return;
+  const payload = buildKeysFilePayload();
+  const d = new Date();
+  const ymd = String(d.getFullYear()) + String(d.getMonth()+1).padStart(2,'0') + String(d.getDate()).padStart(2,'0');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], { type:'application/json' }));
+  a.download = 'startpage-keys-' + ymd + '.json';
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(()=>{ try { URL.revokeObjectURL(a.href); } catch(_){} }, 5000);
+  alert('Saved. This file contains your actual keys' +
+    (payload.gh && payload.gh.pat ? ' — including your GitHub token, which grants write access to your repo' : '') +
+    ' — keep it somewhere private (not email or chat), and delete it once your dashboard is set up and synced.');
+}
+// Prefill cfg from a loaded file. Accepts kind 'startpage-keys' (ANY v — only
+// whitelisted fields are read, so future versions degrade gracefully) and
+// 'startpage-settings' exports that include keys. Returns how many values were
+// applied, or -1 if the object isn't a recognized payload. PREFILL ONLY — this
+// never fabricates a test result: a green ✅ must always mean "verified now".
+function applyLoadedKeys(obj){
+  let keys = null, gh = null;
+  if (obj && obj.kind === 'startpage-keys' && obj.keys && typeof obj.keys === 'object'){
+    keys = obj.keys; gh = (obj.gh && typeof obj.gh === 'object') ? obj.gh : null;
+  } else if (obj && obj.kind === 'startpage-settings' && obj.state && typeof obj.state === 'object'){
+    keys = obj.state;
+  } else return -1;
+  let n = 0;
+  KEYS_FILE_FIELDS.forEach(f=>{ const v = keys[f]; if (typeof v === 'string' && v.trim()){ cfg[f] = v.trim().slice(0,4000); n++; } });
+  if (gh){
+    if (typeof gh.pat === 'string' && gh.pat.trim()){ cfg.ghPat = gh.pat.trim().slice(0,4000); n++; }
+    if (typeof gh.repo === 'string' && gh.repo.trim()){ cfg.ghRepo = normRepo(gh.repo); n++; }
+    if (typeof gh.path === 'string' && gh.path.trim()){ cfg.ghPath = gh.path.trim().slice(0,400); n++; }
+  }
+  return n;
+}
+let loadedKeysMsg = null;   // welcome-step success banner; survives the go() re-render
+function saveKeysTip(){
+  return el('div', { class:'hint', style:'margin:0 0 14px', text:'💾 Tip: after each ✅, click “Save keys file” below — if this page ever restarts, you can load the file instead of collecting every key again.' });
+}
+function refreshSaveKeysBtn(){
+  const b = $('saveKeysBtn'); if (!b) return;
+  const ok = hasAnyCredential();
+  b.disabled = !ok;
+  b.title = ok ? 'Download a private file of the keys you’ve entered so far — restart insurance.'
+              : 'Nothing to save yet — add a key first.';
+}
+// One reusable "prefer Google sign-in" nudge (deliberately says "when offered" —
+// provider auth pages change; we don't promise a button we don't control).
+function googleSignInHint(extraText){
+  return el('div', { class:'hint', style:'margin:0 0 14px' },
+    el('b', { text:'Tip: ' }),
+    'When a sign-up page offers “Sign in with Google”, use it — one account, no new password to store, and faster verification. ' + (extraText || ''));
+}
+
 /* ───────────────────────── STEPS ───────────────────────── */
 const STEPS = [
   /* 0 — Welcome */
@@ -549,6 +624,31 @@ const STEPS = [
       el('details', { class:'adv' },
         el('summary', { text:'I already have a settings file' }),
         el('p', { class:'hint', text:'If a friend sent you a startpage-settings…json export, open the dashboard and use ⇅ Sync → Import instead — that restores everything at once.' })
+      ),
+      el('details', { class:'adv', open: loadedKeysMsg ? 'open' : null },
+        el('summary', { text:'Load keys file — I saved one from this wizard before' }),
+        el('p', { class:'hint', text:'Pick the startpage-keys…json file you downloaded with “💾 Save keys file” (a startpage-settings export that includes keys works too). Your saved values are filled back in — then click Test on each step to verify them.' }),
+        (function(){
+          const res = el('div', { class:'result', id:'res-keysfile' });
+          if (loadedKeysMsg) paintResult(res, { ok:true, detail: loadedKeysMsg, fix:null });
+          const inp = el('input', { type:'file', id:'in-keysfile', accept:'.json,application/json' });
+          inp.addEventListener('change', ()=>{
+            const f = inp.files && inp.files[0]; if (!f) return;
+            const rd = new FileReader();
+            rd.onload = ()=>{
+              let obj = null; try { obj = JSON.parse(String(rd.result || '')); } catch(_){}
+              const n = obj ? applyLoadedKeys(obj) : -1;
+              if (n < 0){ paintResult(res, { ok:false, detail:'That doesn’t look like a keys or settings file.', fix:'Choose the startpage-keys…json file this wizard saved, or a startpage-settings export that includes keys.' }); return; }
+              if (n === 0){ paintResult(res, { ok:false, detail:'That file is valid but contains no saved keys.', fix:'Enter your keys on the next steps, then use “💾 Save keys file” to snapshot them.' }); return; }
+              // Filename + count rendered via textContent (paintResult) — never as HTML.
+              loadedKeysMsg = 'Loaded ' + n + ' saved value' + (n === 1 ? '' : 's') + ' from ' + f.name + ' — click Test on each step to verify them.';
+              go(stepIdx);   // re-render → prefilled fields + this banner (no results are fabricated)
+            };
+            rd.onerror = ()=>paintResult(res, { ok:false, detail:'Couldn’t read that file.', fix:'Try picking it again.' });
+            rd.readAsText(f);
+          });
+          return el('div', {}, el('div', { class:'inrow', style:'margin:6px 0' }, inp), res);
+        })()
       ),
       el('div',{class:'skipnote', text: isHttpOrigin() ? ('Running at: '+location.origin) : 'You opened this by double-clicking the file — everything works except the advanced Google sign-in (the simple calendar link still works fine).'}),
       privacyFooter()
@@ -606,6 +706,8 @@ const STEPS = [
     c.append(el('h2', {}, 'Smart market analysis ', el('span',{class:'opt rec',text:'recommended'})),
       el('p',{class:'lead', text:'These free AI keys power the market read and the stock picker. Add at least one to start — add more later for a stronger second opinion.'}),
       el('div',{class:'why'}, el('b',{text:'Easiest first: '}), 'Click a “get a free key” link, sign in, click “Create key”, copy it, paste below, and hit Test. A ✅ means you’re good.'),
+      googleSignInHint('Gemini’s AI Studio IS Google — just sign in. Groq and Mistral both offer Google sign-in on their sign-up pages.'),
+      saveKeysTip(),
       keyField('geminiApiKey', { hint:'Google AI Studio — usually the quickest to get.' }),
       keyField('groqApiKey',   { hint:'Groq — very fast, generous free tier.' }),
       keyField('mistralApiKey',{ hint:'Mistral — European models.' }),
@@ -623,13 +725,15 @@ const STEPS = [
     c.append(el('h2', {}, 'The data relay ', el('span',{class:'opt rec',text:'recommended'})),
       el('p',{class:'lead', text:'This is the trickiest step — about 5 minutes, completely free, no credit card, and you can’t break anything. Take a breath; here’s exactly what to do.'}),
       el('div',{class:'why'}, el('b',{text:'Why: '}), 'For security reasons your browser blocks websites from pulling in stock and economic data directly (and some office networks block those sites too). This tiny free relay you run on Cloudflare passes the data through for you. It powers live stock prices and the economic signals.'),
+      saveKeysTip(),
       el('ol',{class:'steps'},
         el('li',{}, 'Create a free account at ', el('a',{href:'https://dash.cloudflare.com/sign-up',target:'_blank',rel:'noopener noreferrer',text:'dash.cloudflare.com'}), ' — no credit card needed.'),
-        el('li',{text:'In the left-hand menu click “Workers & Pages”, then the “Create” button, then “Create Worker”. Cloudflare gives it a random name and shows a “Deploy” button — just click Deploy (you’ll replace the sample code in a moment).'}),
-        el('li',{text:'Once it’s deployed, click “Edit code” (sometimes shown as “< > Edit Code”) to open the big code editor.'}),
-        el('li',{}, 'Click inside the code box, press ', el('b',{text:'Ctrl/Cmd + A'}), ' to select everything, then paste OUR code over it (use the Copy button below). Don’t worry about deleting the old code — paste replaces it.'),
-        el('li',{text:'Click “Deploy” (or “Save and deploy”). Copy the address it shows — it ends in .workers.dev — and paste it below.'})
+        el('li',{}, 'In the left menu click ', el('b',{text:'“Workers & Pages” → “Create” → “Create Worker”'}), '. If Cloudflare asks you to pick a starter template, choose ', el('b',{text:'“Hello World”'}), ' — the plainest one. It’s a placeholder; our code replaces all of it in step 4. (If you aren’t offered templates, any new Worker is fine — you’re replacing its code anyway.)'),
+        el('li',{}, el('b',{text:'Name it something you’ll recognise'}), ' (e.g. my-dashboard-relay) — the name becomes the first part of your worker’s address: ', el('code',{class:'mono'}, el('b',{text:'your-name'}), '.', el('i',{text:'your-subdomain'}), '.workers.dev'), ' — ', el('b',{text:'only the first part is yours to choose'}), '; Cloudflare assigns the rest. Click ', el('b',{text:'Deploy'}), '.'),
+        el('li',{}, 'Click ', el('b',{text:'“Edit code”'}), ' (sometimes shown as “< > Edit Code”), click inside the code box, press ', el('b',{text:'Ctrl/Cmd + A'}), ' to select ', el('b',{text:'everything'}), ', and paste OUR code over it (use the Copy button below). ', el('b',{text:'You are REPLACING ALL of Cloudflare’s sample code — that’s the whole point.'}), ' Paste-over-selection deletes it for you; nothing to clean up.'),
+        el('li',{}, 'Click ', el('b',{text:'“Deploy”'}), ' (or “Save and deploy”) again. Copy the full address it shows — it ends in .workers.dev — and paste it below, then Test.')
       ),
+      el('div',{class:'why'}, el('b',{text:'📝 Write this address down'}), ' — you’ll need it on any other computer. Easiest way: paste it below, click Test, then hit ', el('b',{text:'“💾 Save keys file”'}), ' below — the file captures the address for you.'),
       el('div',{class:'why',style:'border-left-color:var(--ok)'}, el('b',{text:'Don’t panic: '}), 'You can’t break anything, and it’s free with no credit card. Cloudflare occasionally renames buttons — as long as you end up on a page with a big code editor and a Deploy button, you’re in the right place.'),
       badge ? workerReadyBadge() : null,
       el('div',{id:'workercode'}),
@@ -648,7 +752,8 @@ const STEPS = [
     skipConsequence:'These are bonus data feeds, so skipping them changes nothing you can already see — you just won’t get the interest-rate / recession regime (FRED), oil-inventory energy signal (EIA), or the alternative price source (Twelve Data). The dashboard’s normal prices and analysis are unaffected. Add any of these later in Settings → API keys.',
     render(c){
     c.append(el('h2', {}, 'Extra economic signals ', el('span',{class:'opt optl',text:'optional · nerdy'})),
-      el('p',{class:'lead', text:'Free government & market data the dashboard can fold into its analysis. All optional — most people skip these. FRED and EIA need the Data relay from the previous step.'}));
+      el('p',{class:'lead', text:'Free government & market data the dashboard can fold into its analysis. All optional — most people skip these. FRED and EIA need the Data relay from the previous step.'}),
+      googleSignInHint('FRED and EIA are US-government sites that use plain email registration (no Google button — your key arrives by email). Twelve Data offers Google sign-in.'));
     if (!workerReady()) c.append(el('div',{class:'filebanner', text:'Set up the Data relay first (previous step) — FRED and EIA flow through it. You can still skip everything here.'}));
     c.append(
       el('details',{class:'adv'}, el('summary',{text:'FRED — interest-rate & recession signals (free)'}),
@@ -859,6 +964,7 @@ function render(){
   $('nextBtn').style.display = last ? 'none' : '';
   $('skipBtn').style.display = (last || !step.optional) ? 'none' : '';
   $('nextBtn').textContent = (stepIdx===STEPS.length-2) ? 'Review →' : 'Next →';
+  refreshSaveKeysBtn();
   refreshRail();
   // focus heading for a11y
   const h = card.querySelector('h2'); if (h){ h.setAttribute('tabindex','-1'); h.focus({preventScroll:true}); }
@@ -885,6 +991,7 @@ function isStepDone(s, i){
 }
 
 $('nextBtn').addEventListener('click', ()=>go(stepIdx+1));
+$('saveKeysBtn').addEventListener('click', saveKeysFile);
 $('backBtn').addEventListener('click', ()=>go(stepIdx-1));
 $('skipBtn').addEventListener('click', ()=>go(stepIdx+1));
 document.addEventListener('keydown', (e)=>{
@@ -901,7 +1008,7 @@ document.addEventListener('keydown', (e)=>{
   for (let i=0;i<=stepIdx;i++) visited.add(i);   // resume: prior steps are reachable in the rail
   render();
 })();
-window.__wizard = { STEPS, TESTS, cfg, results, commit, collectStateForCommit, go, KEYINFO }; // test hook
+window.__wizard = { STEPS, TESTS, cfg, results, commit, collectStateForCommit, go, KEYINFO, buildKeysFilePayload, applyLoadedKeys, hasAnyCredential, saveKeysFile }; // test hook
 </script>
 </body>
 </html>

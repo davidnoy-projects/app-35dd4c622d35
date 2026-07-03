@@ -16920,6 +16920,60 @@ function computeAccelerationExhaustion(closes) {
   return { accelRatio, consecutiveDays: streak, streakDir, direction, magnitude, priorKey, message };
 }
 
+// ── Fibonacci retracement levels — display-only deep-dive helper ──────────
+// Dominant swing = max/min of the last FIB_LOOKBACK_DAYS closes. Direction-
+// aware: an UP swing (low before high) puts retracement levels BELOW the
+// high as potential support (price = high − range×ratio); a DOWN swing
+// (high before low) puts them ABOVE the low as potential resistance
+// (price = low + range×ratio). 61.8% (golden ratio, 1/φ) and 78.6% (deep,
+// √0.618) are the primary levels; 38.2%/50% are shallow secondary context.
+// Landmarks, not predictions. [feat:fib-retracement]
+const FIB_LOOKBACK_DAYS = 90;   // ~one quarter of trading days
+const FIB_NEAR_PCT = 1.0;       // |distance| ≤ 1% ⇒ "at level"
+const FIB_MIN_SWING_PCT = 5;    // flatter windows have no swing worth retracing
+
+function computeFibonacciLevels(closes, opts) {
+  const o = opts || {};
+  const lookback    = Number.isFinite(o.lookback)    ? o.lookback    : FIB_LOOKBACK_DAYS;
+  const ratios      = Array.isArray(o.ratios)        ? o.ratios      : [0.382, 0.5, 0.618, 0.786];
+  const nearPct     = Number.isFinite(o.nearPct)     ? o.nearPct     : FIB_NEAR_PCT;
+  const minSwingPct = Number.isFinite(o.minSwingPct) ? o.minSwingPct : FIB_MIN_SWING_PCT;
+  if (!Array.isArray(closes) || closes.length < 30) return null;
+  const w = closes.slice(-lookback);
+  if (!w.every(v => Number.isFinite(v) && v > 0)) return null;
+  // First occurrence of the window extremes (ties don't move the level prices).
+  let hiIdx = 0, loIdx = 0;
+  for (let i = 1; i < w.length; i++) {
+    if (w[i] > w[hiIdx]) hiIdx = i;
+    if (w[i] < w[loIdx]) loIdx = i;
+  }
+  const high = w[hiIdx], low = w[loIdx];
+  const range = high - low;
+  if (low <= 0 || (range / low) * 100 < minSwingPct) return null;
+  const direction = loIdx < hiIdx ? 'up' : 'down';
+  const current = closes[closes.length - 1];
+  const levels = ratios.map(r => {
+    const price = +(direction === 'up' ? high - range * r : low + range * r).toFixed(2);
+    const distPct = +(((current - price) / price) * 100).toFixed(2);
+    return {
+      ratio: r,
+      label: (r * 100).toFixed(1).replace(/\.0$/, '') + '%',
+      price,
+      distPct,
+      near: Math.abs(distPct) <= nearPct,
+      primary: r === 0.618 || r === 0.786,
+    };
+  });
+  return {
+    direction,
+    lookback: w.length,
+    high, low, hiIdx, loIdx,
+    swingPct: +((range / low) * 100).toFixed(1),
+    current,
+    levels,
+  };
+}
+
 // ── Gap-stacking state — invert pre-market when gaps are stacking ─────────
 // Tracks per-ticker gap history. When 3+ consecutive same-direction gaps
 // total >5%, the *next* pre-market gap is treated as EXHAUSTION (not
@@ -19619,6 +19673,56 @@ function _ddSignalsSection(sym, pred, volRegime) {
   </div>`;
 }
 
+// [feat:fib-retracement] Fibonacci retracement — between Signals and History.
+// Absent ('') whenever there is no pred payload, no closes, or no swing worth
+// retracing (the app's no-placeholder philosophy).
+function _ddFibonacciSection(sym, pred) {
+  const closes = pred?.movingAverages?.closes;
+  let fib = null;
+  try { fib = computeFibonacciLevels(closes); } catch (_) { fib = null; }
+  if (!fib) return '';
+
+  const dirWord  = fib.direction === 'up' ? 'UP' : 'DOWN';
+  const roleWord = fib.direction === 'up' ? 'support' : 'resistance';
+  const swingStr = fib.direction === 'up'
+    ? `$${_ddFmtNum(fib.low)} → $${_ddFmtNum(fib.high)}`
+    : `$${_ddFmtNum(fib.high)} → $${_ddFmtNum(fib.low)}`;
+
+  let rows = '';
+  for (const l of fib.levels) {
+    // Up-swing levels are support: trading above them (dist ≥ 0) is the healthy
+    // side → green. Down-swing levels are resistance: below them is healthy.
+    const distColor = (l.distPct >= 0) === (fib.direction === 'up') ? 'var(--success)' : 'var(--danger)';
+    const nearChip = l.near
+      ? `<span style="margin-left:6px;font-size:9px;font-weight:700;color:var(--primary);">≈ at level</span>`
+      : '';
+    const rowWeight = l.primary ? '700' : '400';
+    const rowColor  = l.primary ? 'var(--text)' : 'var(--muted)';
+    rows += `<tr>
+      <td style="padding:4px 8px;border-top:1px solid var(--border);font-weight:${rowWeight};color:${rowColor};">${esc(l.label)}</td>
+      <td style="padding:4px 8px;border-top:1px solid var(--border);text-align:right;font-family:var(--font-mono);font-weight:${rowWeight};color:${rowColor};">$${_ddFmtNum(l.price)}</td>
+      <td style="padding:4px 8px;border-top:1px solid var(--border);text-align:right;font-family:var(--font-mono);color:${distColor};">${_ddFmtPct(l.distPct)}${nearChip}</td>
+    </tr>`;
+  }
+
+  const chart = (typeof _drawFibChart === 'function') ? _drawFibChart(closes, 560, 120, fib) : '';
+  return `<div style="margin-bottom:14px;">
+    <div style="font-weight:800;font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--text);margin-bottom:6px;">Fibonacci Retracement — ${esc(sym)} &nbsp;<span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--muted);font-size:10px;">${fib.lookback}d swing ${esc(dirWord)} ${_ddFmtPct(fib.direction === 'up' ? fib.swingPct : -fib.swingPct, 1)} (${swingStr})</span></div>
+    <div style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;overflow:hidden;">
+      <table style="width:100%;border-collapse:collapse;font-size:11px;">
+        <thead><tr style="background:var(--surface);">
+          <th style="text-align:left;padding:4px 8px;font-size:10px;text-transform:uppercase;letter-spacing:.4px;">Level</th>
+          <th style="text-align:right;padding:4px 8px;font-size:10px;text-transform:uppercase;letter-spacing:.4px;">Price</th>
+          <th style="text-align:right;padding:4px 8px;font-size:10px;text-transform:uppercase;letter-spacing:.4px;">From current</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+      ${chart ? `<div style="padding:6px 8px 2px;">${chart}</div>` : ''}
+      <div style="padding:5px 8px;border-top:1px solid var(--border);font-size:9px;color:var(--muted);"><b>Formula:</b> retracements of the dominant ${fib.lookback}-day swing (window max/min). 61.8% is the golden-ratio retracement (1/φ), 78.6% the deep retracement (√0.618) — watched as ${roleWord} on pullbacks. A hold at 61.8% conventionally reads "trend intact"; a slice through 78.6% means the swing is being fully unwound. Self-fulfilling landmarks, not predictions.</div>
+    </div>
+  </div>`;
+}
+
 function _ddHistorySection(sym) {
   const horizonMode = (typeof getHorizonDays === 'function') ? `${getHorizonDays()}d` : null;
   let recent = [];       // last 10 predictions regardless of horizon
@@ -19724,6 +19828,7 @@ function openStockDeepDive(sym) {
   html += _ddVotesSection(sym, pred);
   html += _ddQuantBaselineSection(sym, pred);
   html += _ddSignalsSection(sym, pred, volRegime);
+  html += _ddFibonacciSection(sym, pred); // [feat:fib-retracement]
   html += _ddHistorySection(sym);
   if (!pred) {
     html += `<div style="background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:10px 12px;font-size:10px;color:var(--muted);">
@@ -26956,6 +27061,45 @@ function _drawSparkline(closes, w, h) {
     return `${x.toFixed(1)},${y.toFixed(1)}`;
   }).join(' ');
   return `<svg width="${w}" height="${h}" style="overflow:visible"><polyline points="${pts}" fill="none" stroke="var(--primary)" stroke-width="1.5" stroke-linejoin="round"/></svg>`;
+}
+
+// [feat:fib-retracement] Fib-aware sibling of _drawSparkline (which stays
+// untouched — sector heatmap + perf modal depend on it). Plots the same
+// slice(-fib.lookback) window the levels were computed from, so hiIdx/loIdx
+// line up. The y-domain covers BOTH the closes window AND every level price,
+// so an off-window level never clips. Dashed line + right-edge label per
+// level; two small circles mark the swing high/low.
+function _drawFibChart(closes, w, h, fib) {
+  if (!Array.isArray(closes) || closes.length < 2 || !fib || !Array.isArray(fib.levels) || !fib.levels.length) return '';
+  const win = closes.slice(-(fib.lookback || closes.length));
+  if (win.length < 2 || !win.every(v => Number.isFinite(v))) return '';
+  const levelPrices = fib.levels.map(l => l.price).filter(Number.isFinite);
+  const min = Math.min(...win, ...levelPrices);
+  const max = Math.max(...win, ...levelPrices);
+  const range = max - min || 1;
+  const padR = 34;                                  // room for right-edge labels
+  const plotW = w - padR;
+  const X = i => (i / (win.length - 1)) * plotW;
+  const Y = v => h - ((v - min) / range) * h;
+  const pts = win.map((v, i) => `${X(i).toFixed(1)},${Y(v).toFixed(1)}`).join(' ');
+  let lines = '';
+  for (const l of fib.levels) {
+    const y = Y(l.price).toFixed(1);
+    const color = l.primary
+      ? (fib.direction === 'up' ? 'var(--success)' : 'var(--danger)')
+      : 'var(--muted)';
+    lines += `<line x1="0" y1="${y}" x2="${plotW}" y2="${y}" stroke="${color}" stroke-width="1" stroke-dasharray="4 3" opacity="${l.primary ? '0.9' : '0.45'}"/>`;
+    lines += `<text x="${(plotW + 3).toFixed(1)}" y="${y}" font-size="9" fill="var(--muted)" dominant-baseline="middle">${esc(l.label)}</text>`;
+  }
+  // Swing extreme markers — makes the direction-awareness legible at a glance.
+  let marks = '';
+  if (Number.isFinite(fib.hiIdx) && fib.hiIdx >= 0 && fib.hiIdx < win.length) {
+    marks += `<circle cx="${X(fib.hiIdx).toFixed(1)}" cy="${Y(win[fib.hiIdx]).toFixed(1)}" r="1.5" fill="var(--success)"/>`;
+  }
+  if (Number.isFinite(fib.loIdx) && fib.loIdx >= 0 && fib.loIdx < win.length) {
+    marks += `<circle cx="${X(fib.loIdx).toFixed(1)}" cy="${Y(win[fib.loIdx]).toFixed(1)}" r="1.5" fill="var(--danger)"/>`;
+  }
+  return `<svg viewBox="0 0 ${w} ${h}" style="width:100%;height:auto;overflow:visible" xmlns="http://www.w3.org/2000/svg">${lines}<polyline points="${pts}" fill="none" stroke="var(--primary)" stroke-width="1.5" stroke-linejoin="round"/>${marks}</svg>`;
 }
 
 async function _fetchSectorRange(symbols, range, interval) {
