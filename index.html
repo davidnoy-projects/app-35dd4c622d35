@@ -22289,21 +22289,27 @@ function _perfRollingSeries(rows, opts) {
 // (the caller excludes such entries from vsSpyN) — never back-filled or guessed.
 // Directional excess: bullish → (actualPct − spyMovePct); bearish → flipped;
 // neutral → excluded.
-function _perfMaiVsSpy(predDateKey, horizonDays, actualPct, sentiment) {
+// Generalized to any logged benchmark (SPY, QQQ — dailyPriceLog carries both
+// since the PICKER_BENCHMARKS upgrade; QQQ history starts then, older days → null).
+function _perfMaiVsBench(predDateKey, horizonDays, actualPct, sentiment, benchSym) {
   try {
     if (actualPct == null || !Number.isFinite(actualPct)) return null;
     const dir = _sentimentDir(sentiment);
     if (dir === 0) return null;                       // neutral calls excluded
     const log = S.dailyPriceLog;
     if (!log) return null;
-    const spyEntry = log[predDateKey] && log[predDateKey].SPY;
-    if (spyEntry == null) return null;
-    const spyOut = _getDailyPrice('SPY', predDateKey, horizonDays);
-    if (spyOut == null) return null;
-    const spyMovePct = (spyOut - spyEntry) / spyEntry * 100;
-    const excess = actualPct - spyMovePct;
+    const b = benchSym || 'SPY';
+    const bEntry = log[predDateKey] && log[predDateKey][b];
+    if (bEntry == null) return null;
+    const bOut = _getDailyPrice(b, predDateKey, horizonDays);
+    if (bOut == null) return null;
+    const bMovePct = (bOut - bEntry) / bEntry * 100;
+    const excess = actualPct - bMovePct;
     return +(dir * excess).toFixed(2);                // flip sign for bearish calls
   } catch (_) { return null; }
+}
+function _perfMaiVsSpy(predDateKey, horizonDays, actualPct, sentiment) {
+  return _perfMaiVsBench(predDateKey, horizonDays, actualPct, sentiment, 'SPY');
 }
 
 // Collect graded Market-AI rows for the lookback window, matching the canonical
@@ -22328,6 +22334,7 @@ function _perfMaiGradedRows() {
           actualPct: (typeof rec.actualPct === 'number') ? rec.actualPct : null,
           sentiment: rec.sentiment,
           vsSpy: _perfMaiVsSpy(dateKey, entryHorizon, rec.actualPct, rec.sentiment),
+          vsQqq: _perfMaiVsBench(dateKey, entryHorizon, rec.actualPct, rec.sentiment, 'QQQ'),
         });
       }
     }
@@ -22345,6 +22352,9 @@ function _perfEngineStat(engine, rows, meta) {
   const spyRows = rows.filter(r => r.vsSpy != null && Number.isFinite(r.vsSpy));
   const vsSpyN = spyRows.length;
   const vsSpyAlpha = vsSpyN ? spyRows.reduce((s, r) => s + r.vsSpy, 0) / vsSpyN : null;
+  const qqqRows = rows.filter(r => r.vsQqq != null && Number.isFinite(r.vsQqq));
+  const vsQqqN = qqqRows.length;
+  const vsQqqAlpha = vsQqqN ? qqqRows.reduce((s, r) => s + r.vsQqq, 0) / vsQqqN : null;
   // best/worst by realized move in the predicted direction (informational).
   let best = null, worst = null;
   for (const r of rows) {
@@ -22362,6 +22372,7 @@ function _perfEngineStat(engine, rows, meta) {
     engine, n,
     acc, accLo: wb.lo, accHi: wb.hi,
     vsSpyAlpha, vsSpyN,
+    vsQqqAlpha, vsQqqN,
     best, worst,
     accSeries: series.accSeries, accSeriesN: series.accSeriesN, equitySeries: series.equitySeries,
     lowN: n > 0 && n < SCOREBOARD_MIN_N,
@@ -22395,6 +22406,7 @@ function _perfScoreboardData() {
       actualPct: (g.grade && typeof g.grade.movePct === 'number') ? g.grade.movePct : null,
       sentiment: g.direction,            // 'bull' | 'bear' for best/worst sign
       vsSpy: (g.grade && g.grade.vs_spy != null) ? g.grade.vs_spy : null,
+      vsQqq: (g.grade && g.grade.bench && g.grade.bench.QQQ && g.grade.bench.QQQ.vs != null) ? g.grade.bench.QQQ.vs : null,
     }));
     picker = _perfEngineStat('picker', rows, { horizonDays: pkHorizon, thresholdPct: null, vsSpyDerived: false });
   } catch (_) {
@@ -22414,15 +22426,16 @@ function _perfRenderScoreboardCard(st, title, kind /* 'predictions'|'picks' */) 
   const ci = (st.accLo != null && st.accHi != null)
     ? `<span class="sb-ci">(${Math.round(st.accLo*100)}–${Math.round(st.accHi*100)}%, 95%)</span>` : '';
   const lowTag = st.lowN ? '<span class="sb-lowtag">low n</span>' : '';
-  // vs-SPY line.
-  let spyLine;
-  if (st.vsSpyN > 0 && st.vsSpyAlpha != null) {
-    const a = st.vsSpyAlpha;
-    const cls = a >= 0 ? 'sb-pos' : 'sb-neg';
-    spyLine = `<div class="sb-line"><span class="${cls}">${a >= 0 ? '+' : ''}${a.toFixed(2)}%</span> vs SPY${st.vsSpyDerived ? ' (derived)' : ''} · ${st.vsSpyN} with SPY data</div>`;
-  } else {
-    spyLine = `<div class="sb-line perf-muted">vs SPY${st.vsSpyDerived ? ' (derived)' : ''}: not enough data yet</div>`;
-  }
+  // Benchmark lines — SPY and QQQ, each independently honest about data coverage
+  // (QQQ history starts at the PICKER_BENCHMARKS upgrade; older rows have none).
+  const benchLine = (label, alpha, n) => {
+    if (n > 0 && alpha != null) {
+      const cls = alpha >= 0 ? 'sb-pos' : 'sb-neg';
+      return `<div class="sb-line"><span class="${cls}">${alpha >= 0 ? '+' : ''}${alpha.toFixed(2)}%</span> vs ${label}${st.vsSpyDerived ? ' (derived)' : ''} · ${n} with ${label} data</div>`;
+    }
+    return `<div class="sb-line perf-muted">vs ${label}${st.vsSpyDerived ? ' (derived)' : ''}: not enough data yet</div>`;
+  };
+  const spyLine = benchLine('SPY', st.vsSpyAlpha, st.vsSpyN) + benchLine('QQQ', st.vsQqqAlpha, st.vsQqqN);
   const chip = (label, c) => c ? `<span class="perf-chip">${esc(label)} ${esc(c.sym)} ${c.movePct != null ? (c.movePct >= 0 ? '+' : '') + c.movePct.toFixed(1) + '%' : ''}</span>` : '';
   const chips = (st.best || st.worst) ? `<div style="margin-top:6px;">${chip('best', st.best)}${chip('worst', st.worst)}</div>` : '';
   const thr = st.thresholdPct != null ? `${(+st.thresholdPct).toFixed(1)}%` : 'its';
@@ -22467,7 +22480,7 @@ function _perfRenderScoreboard() {
     + _perfRenderScoreboardCard(d.picker, 'AI Picker', 'picks')
     + `</div>`;
   const sparks = _perfRenderScoreboardSparks(d.mai, 'Market-AI') + _perfRenderScoreboardSparks(d.picker, 'AI Picker');
-  return `<div class="perf-section"><div class="perf-section-title">Scoreboard — accuracy vs SPY (95% Wilson interval)</div>${cards}${sparks}</div>`;
+  return `<div class="perf-section"><div class="perf-section-title">Scoreboard — accuracy vs SPY / QQQ (95% Wilson interval)</div>${cards}${sparks}</div>`;
 }
 
 // Expose pure aggregators for the test harness (mirrors other _perf* exports).
@@ -22645,12 +22658,14 @@ function renderPerformanceModal() {
       const da = st.driverAttribution || {};
       const drvRows = Object.entries(da).map(([k, v]) => ({ label: (PICKER_DRIVER_LABELS[k] || k), pct: Math.round(v * 100) }));
       const alpha = st.vsSpyAlpha != null ? `${st.vsSpyAlpha >= 0 ? '+' : ''}${st.vsSpyAlpha.toFixed(2)}%` : '--';
+      const alphaQ = st.vsQqqAlpha != null ? `${st.vsQqqAlpha >= 0 ? '+' : ''}${st.vsQqqAlpha.toFixed(2)}%` : '--';
       const avgRet = st.avgReturnOnCorrect != null ? `${st.avgReturnOnCorrect.toFixed(2)}%` : '--';
       const best = st.bestPick ? `<span class="perf-chip">best ${esc(st.bestPick.sym)} ${st.bestPick.movePct != null ? (st.bestPick.movePct >= 0 ? '+' : '') + st.bestPick.movePct.toFixed(1) + '%' : ''}</span>` : '';
       const worst = st.worstPick ? `<span class="perf-chip">worst ${esc(st.worstPick.sym)} ${st.worstPick.movePct != null ? (st.worstPick.movePct >= 0 ? '+' : '') + st.worstPick.movePct.toFixed(1) + '%' : ''}</span>` : '';
       sections.push(`<div class="perf-section"><div class="perf-section-title">AI Picker detail (${st.N} picks)</div>
         <table class="perf-table"><tbody>
           <tr><td>vs-SPY alpha</td><td>${alpha}</td></tr>
+          <tr><td>vs-QQQ alpha</td><td>${alphaQ}</td></tr>
           <tr><td>Avg return on correct</td><td>${avgRet}</td></tr>
         </tbody></table>
         <div class="perf-section-title" style="margin-top:8px;">Confidence calibration</div>${_perfRenderBarChart(confRows)}
@@ -30691,7 +30706,18 @@ async function _renderSincePerformance(picks) {
       html += ` · avg <strong class="${ac}">${perf.avgDir >= 0 ? '+' : ''}${perf.avgDir.toFixed(1)}%</strong>`;
     }
     if (perf.spyRet != null) html += ` · SPY ${perf.spyRet >= 0 ? '+' : ''}${perf.spyRet.toFixed(1)}%`;
-    if (perf.alpha != null) { const ac = perf.alpha >= 0 ? 'up' : 'down'; html += ` · <span class="${ac}">α ${perf.alpha >= 0 ? '+' : ''}${perf.alpha.toFixed(1)}%</span>`; }
+    // QQQ comparison alongside SPY (benchEntry captured at pick time; day-log
+    // recovery mirrors the SPY path; silently absent for pre-upgrade caches).
+    let qqqRet = null;
+    try {
+      let qqqEntry = +((cached.benchEntry && cached.benchEntry.QQQ) || 0);
+      if (!(qqqEntry > 0) && pickDayKey) qqqEntry = +_getDailyPrice('QQQ', pickDayKey, 0) || 0;
+      const qqqNow = priceMap.QQQ != null ? +priceMap.QQQ : null;
+      if (qqqEntry > 0 && qqqNow > 0) qqqRet = (qqqNow - qqqEntry) / qqqEntry * 100;
+    } catch (_) {}
+    if (qqqRet != null) html += ` · QQQ ${qqqRet >= 0 ? '+' : ''}${qqqRet.toFixed(1)}%`;
+    if (perf.alpha != null) { const ac = perf.alpha >= 0 ? 'up' : 'down'; html += ` · <span class="${ac}">α/SPY ${perf.alpha >= 0 ? '+' : ''}${perf.alpha.toFixed(1)}%</span>`; }
+    if (qqqRet != null && perf.avgDir != null) { const aq = perf.avgDir - qqqRet; const ac = aq >= 0 ? 'up' : 'down'; html += ` · <span class="${ac}">α/QQQ ${aq >= 0 ? '+' : ''}${aq.toFixed(1)}%</span>`; }
     sinceEl.innerHTML = html;
   }
 }
@@ -30936,7 +30962,7 @@ function _updatePickerWeights(gradedPicks) {
 function getPickerStats() {
   const G = _pickerAllGraded();
   const N = G.length;
-  if (N === 0) return { N: 0, directionalAccuracy: null, avgReturnOnCorrect: null, vsSpyAlpha: null, confidenceCalibration: {}, driverAttribution: {}, signalAttribution: {}, bestPick: null, worstPick: null };
+  if (N === 0) return { N: 0, directionalAccuracy: null, avgReturnOnCorrect: null, vsSpyAlpha: null, vsQqqAlpha: null, confidenceCalibration: {}, driverAttribution: {}, signalAttribution: {}, bestPick: null, worstPick: null };
 
   const correct = G.filter(g => g.grade.correct);
   const directionalAccuracy = correct.length / N;
@@ -30945,6 +30971,8 @@ function getPickerStats() {
     : null;
   const withSpy = G.filter(g => g.grade.vs_spy != null);
   const vsSpyAlpha = withSpy.length ? withSpy.reduce((s, g) => s + g.grade.vs_spy, 0) / withSpy.length : null;
+  const withQqq = G.filter(g => g.grade.bench && g.grade.bench.QQQ && g.grade.bench.QQQ.vs != null);
+  const vsQqqAlpha = withQqq.length ? withQqq.reduce((s, g) => s + g.grade.bench.QQQ.vs, 0) / withQqq.length : null;
 
   // Confidence calibration buckets
   const buckets = { B1: [], B2: [], B3: [], B4: [] };
@@ -30986,7 +31014,7 @@ function getPickerStats() {
   const bestPick  = sorted[0]  ? { sym: sorted[0].sym,  date: sorted[0].dateKey,  movePct: sorted[0].grade.movePct,  direction: sorted[0].direction  } : null;
   const worstPick = sorted[sorted.length-1] ? { sym: sorted[sorted.length-1].sym, date: sorted[sorted.length-1].dateKey, movePct: sorted[sorted.length-1].grade.movePct, direction: sorted[sorted.length-1].direction } : null;
 
-  return { N, directionalAccuracy, avgReturnOnCorrect, vsSpyAlpha, confidenceCalibration, driverAttribution, signalAttribution, bestPick, worstPick };
+  return { N, directionalAccuracy, avgReturnOnCorrect, vsSpyAlpha, vsQqqAlpha, confidenceCalibration, driverAttribution, signalAttribution, bestPick, worstPick };
 }
 
 // ─── Peer snapshot fetch ──────────────────────────────────────────────────────
@@ -32002,6 +32030,7 @@ function renderPickerTrackRecord() {
     statsEl.innerHTML = `
       <span>Directional accuracy</span><strong>${st.directionalAccuracy != null ? (st.directionalAccuracy * 100).toFixed(0) + '%' : '--'}</strong>
       <span>vs SPY alpha</span><strong>${st.vsSpyAlpha != null ? fmt(st.vsSpyAlpha, '%') : '--'}</strong>
+      <span>vs QQQ alpha</span><strong>${st.vsQqqAlpha != null ? fmt(st.vsQqqAlpha, '%') : '--'}</strong>
       <span>Avg return (correct)</span><strong>${st.avgReturnOnCorrect != null ? '+' + st.avgReturnOnCorrect.toFixed(1) + '%' : '--'}</strong>
       <span>Graded picks</span><strong>${st.N}${pendingCount ? ` <span style="color:var(--muted);font-weight:400">(${pendingCount} pending)</span>` : ''}</strong>`;
   }
