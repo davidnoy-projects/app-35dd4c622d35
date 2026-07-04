@@ -815,6 +815,18 @@
     .sk-pred.bearish { background: rgba(248,113,113,.18); color: var(--danger);  border-color: rgba(248,113,113,.4); box-shadow: 0 0 6px rgba(248,113,113,.3); }
     .sk-pred.neutral { background: var(--surface3);       color: var(--muted);   }
     .sk-pred.loading { opacity: .35; }
+    /* [feat:reversal-earnings-icons] paired glyphs in the 20px pred column.
+       At most ONE extra glyph ever renders beside the pred icon (no-clutter
+       rule); when paired, the pred icon shrinks to 15px so both fit. Extra
+       glyphs use plain title= tooltips (the custom tooltip is .sk-pred-only). */
+    .sk-pred-group { display: inline-flex; gap: 1px; align-items: center; }
+    .sk-pred-group .sk-pred { width: 15px; height: 15px; font-size: 10px; }
+    .sk-rev  { font-size: 13px; line-height: 1; color: var(--success); cursor: help; user-select: none; }
+    .sk-earn { font-size: 12px; line-height: 1; color: var(--warning); cursor: help; user-select: none; }
+    .sk-earn.post { font-size: 10px; letter-spacing: -1px; }
+    .sk-earn.post.up   { color: var(--success); }
+    .sk-earn.post.down { color: var(--danger); }
+    .sk-earn.post.flat { color: var(--muted); }
 
     /* Global floating prediction tooltip (positioned by JS) */
     #stockPredTooltip {
@@ -5619,6 +5631,7 @@ function normalizeImportedState(raw) {
   // Surfacing-only signals (SIGNAL-SURFACING zone). Non-secret; travel with
   // export/sync as ordinary S fields (no strip needed); no export-version bump.
   next.earningsReactions         = (next.earningsReactions && typeof next.earningsReactions === 'object') ? next.earningsReactions : {};  // derived per-ticker history
+  next.earningsDrift             = (next.earningsDrift && typeof next.earningsDrift === 'object' && !Array.isArray(next.earningsDrift)) ? next.earningsDrift : {};  // [feat:earnings-drift] learned post-earnings price drift (object passthrough like pickerJournal)
   next.earningsReactionEnabled   = next.earningsReactionEnabled !== false;        // default true
   next.sentimentDivergence       = next.sentimentDivergence === true;             // default OFF
   next.sectorHeatmap       = (next.sectorHeatmap && typeof next.sectorHeatmap === 'object') ? next.sectorHeatmap : { enabled: true, timeframes: ['1w','1m','3m'] };
@@ -11151,7 +11164,10 @@ function _renderStocksFull() {
       chgCellInner = '<span class="sk-chg"><span class="sk-skel sk-skel-sm"></span></span>';
     }
     const pred = _maiPredictionsByTicker?.[sym];
-    const predIcon = renderStockPredictionIcon(sym, pred);
+    // [feat:reversal-earnings-icons] pred icon + at most ONE conditional glyph
+    // (post-earnings drift > earnings-soon > reversal); byte-identical to the
+    // plain pred icon when no signal is active.
+    const predIcon = renderStockRowIcons(sym, pred, d, (S.earningsDrift || {})[sym], now);
     return `<div class="sk-row${rowStaleCls}" data-sym="${esc(sym)}"
       draggable="true"
       ondragstart="stockDragStart(event,${idx})"
@@ -11250,6 +11266,106 @@ function renderStockPredictionIcon(sym, pred) {
   const arrow = pred.sentiment === 'bullish' ? '▲'
               : pred.sentiment === 'bearish' ? '▼' : '◆';
   return `<span class="sk-pred ${esc(pred.sentiment)}" data-sym="${esc(sym)}">${arrow}</span>`;
+}
+
+// [feat:reversal-earnings-icons] Composite "possible bottoming reversal" read
+// over the per-ticker priceContext bundle (already computed at prediction time
+// — NO new fetches). Pure: takes the priceContext as its only argument.
+// Returns { likely, strength: 0..100, reasons: string[] } or null on no input.
+//   PRO signals (any): v-bottom parabolic fit (R² > 0.9), deep-drawdown band,
+//   oversold-bounce band, exhaustion after a 5+-day DOWN streak.
+//   DISQUALIFIERS (any → not likely): failed breakout, parabolic blow-off.
+//   likely = ≥1 pro && no disqualifier && strength ≥ 50; band-based signals
+//   (DFH bands) alone never qualify with fewer than 2 pro signals — a single
+//   oversold-bounce is too weak a reason to paint a glyph.
+function computeReversalComposite(priceContext) {
+  if (!priceContext || typeof priceContext !== 'object') return null;
+  const par = priceContext.parabolic || null;
+  const dfh = priceContext.distanceFromHigh || null;
+  const fb  = priceContext.failedBreakout || null;
+  const ae  = priceContext.accelerationExhaustion || null;
+
+  const pros = [];  // { mag, band, reason }
+  if (par && par.state === 'v-bottom' && Number(par.rSquared) > 0.9) {
+    pros.push({ mag: Number(par.magnitude) || 50, band: false,
+      reason: `V-bottom curve (R² ${par.rSquared})` });
+  }
+  if (dfh && dfh.band === 'deep-drawdown') {
+    pros.push({ mag: Number(dfh.magnitude) || 70, band: true,
+      reason: `deep drawdown (${Math.abs(Number(dfh.dfhPct) || 0).toFixed(1)}% below 52w high)` });
+  }
+  if (dfh && dfh.band === 'oversold-bounce') {
+    pros.push({ mag: Number(dfh.magnitude) || 55, band: true,
+      reason: `oversold zone (${Math.abs(Number(dfh.dfhPct) || 0).toFixed(1)}% below 52w high)` });
+  }
+  if (ae && ae.streakDir < 0 && ae.consecutiveDays >= 5) {
+    pros.push({ mag: Number(ae.magnitude) || 45, band: false,
+      reason: `${ae.consecutiveDays} straight red sessions (bounce-prone)` });
+  }
+  const disqualified = !!(fb && fb.detected) || !!(par && par.state === 'parabolic-blowoff');
+
+  // Strength = capped blend: strongest signal + a 25% credit for the rest.
+  let strength = 0;
+  if (pros.length) {
+    const mags = pros.map(p => p.mag).sort((a, b) => b - a);
+    strength = Math.min(100, Math.round(mags[0] + 0.25 * mags.slice(1).reduce((s, m) => s + m, 0)));
+  }
+  const bandOnly = pros.length > 0 && pros.every(p => p.band);
+  if (bandOnly && pros.length < 2) strength = Math.min(strength, 45);
+  const likely = pros.length >= 1 && !disqualified && strength >= 50 && !(bandOnly && pros.length < 2);
+  return { likely, strength, reasons: pros.map(p => p.reason) };
+}
+
+// [feat:reversal-earnings-icons] Column-1 icon builder for a stock row: the
+// prediction icon plus AT MOST ONE tiny conditional glyph. Pure: all state
+// (pred payload, stockCache entry, S.earningsDrift[sym] record, clock) comes
+// in as arguments so the real shipping body is testable in the vm harness.
+// Precedence (binding no-clutter rule): pred icon always; then ONE of
+//   post-earnings drift Ⓔ⤒/Ⓔ⤓/Ⓔ· (daysAfter 0-5)
+//   > earnings-soon Ⓔ (daysUntil 0-7)
+//   > reversal ⤴ (composite likely).
+// With no active signal the output is BYTE-IDENTICAL to today's pred icon.
+function renderStockRowIcons(sym, pred, stockData, earningsDriftRec, nowMs) {
+  const predIcon = renderStockPredictionIcon(sym, pred);
+  const now = Number.isFinite(nowMs) ? nowMs : Date.now();
+  let extra = '';
+  try {
+    const eRaw = stockData && stockData.earningsDate;
+    const eTs = eRaw ? (typeof eRaw === 'number' ? eRaw * 1000 : eRaw) : null;
+    const daysUntil = eTs != null ? Math.round((eTs - now) / 86400_000) : null;
+    const daysAfter = eTs != null ? Math.round((now - eTs) / 86400_000) : null;
+
+    if (eTs != null && eTs <= now && daysAfter >= 0 && daysAfter <= 5) {
+      // Post-earnings drift window — learned tendency when we have ≥2 events.
+      const stats = computeEarningsDriftStats(earningsDriftRec && earningsDriftRec.events);
+      const tend = (stats && stats.n >= 2) ? stats.tendency : null;
+      const glyph = tend === 'carries-up' ? 'Ⓔ⤒' : tend === 'carries-down' ? 'Ⓔ⤓' : 'Ⓔ·';
+      const cls = tend === 'carries-up' ? 'up' : tend === 'carries-down' ? 'down' : 'flat';
+      let tip;
+      if (stats && stats.n >= 2) {
+        const word = tend === 'carries-up' ? 'up' : tend === 'carries-down' ? 'down' : 'mixed (no consistent direction)';
+        const med = (stats.medRet3d * 100);
+        tip = `Earnings ${daysAfter}d ago. After its last ${stats.n} reports, ${sym} drifted ${word}, median ${med >= 0 ? '+' : ''}${med.toFixed(1)}% over 3d.`;
+      } else {
+        tip = `Earnings ${daysAfter}d ago — no drift history yet; learning starts with this report.`;
+      }
+      extra = `<span class="sk-earn post ${cls}" title="${esc(tip)}">${glyph}</span>`;
+    } else if (eTs != null && daysUntil >= 0 && daysUntil <= 7) {
+      // Earnings-soon window.
+      let dateStr = '';
+      try { dateStr = new Date(eTs).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }); } catch (_) {}
+      const tip = `Earnings in ${daysUntil}d${dateStr ? ` (${dateStr})` : ''}`;
+      extra = `<span class="sk-earn" title="${esc(tip)}">Ⓔ</span>`;
+    } else {
+      const rc = computeReversalComposite(pred?.enhancedSignals?.priceContext);
+      if (rc && rc.likely) {
+        const tip = `Possible bottoming reversal — ${rc.reasons.join(', ')}. Not advice.`;
+        extra = `<span class="sk-rev" title="${esc(tip)}">⤴</span>`;
+      }
+    }
+  } catch (_) { extra = ''; }
+  if (!extra) return predIcon;   // zero clutter: unchanged rows stay unchanged
+  return `<span class="sk-pred-group">${predIcon}${extra}</span>`;
 }
 
 // Pre/after-hours badge shape for both detail rows and the ticker. Returns
@@ -16487,6 +16603,140 @@ function computeEarningsProximity(stockData) {
   return { symbol, daysUntil, daysAfter, impact, message };
 }
 
+// ═══ [feat:earnings-drift] Learned post-earnings price drift (lite) ═══════
+// Price-only learner: no EPS/surprise fetch (deliberate scope cut — the
+// SIGNAL-SURFACING zone's Earnings Reaction Tracker owns the surprise axis).
+// Storage: S.earningsDrift = { SYM: { events:[{k:'YYYYMMDD',ret1d,ret3d}], asOf } }
+// — ordinary non-secret S field; capped 8 events/sym; events pruned >540d.
+const ED_MAX_EVENTS     = 8;
+const ED_PRUNE_DAYS     = 540;   // ~6 quarters
+const ED_RECORD_MIN_D   = 1;     // record window: daysAfter ∈ [1,4]
+const ED_RECORD_MAX_D   = 4;
+
+// Pure core: realized 1d/3d drift from a daily-price-log slice, anchored at
+// close(dateKey). Weekend/holiday-tolerant via the same +0..+3 calendar-day
+// forward fallback _getDailyPrice uses — but takes the log AS AN ARGUMENT so
+// it is directly testable. Returns { ret1d, ret3d } (each possibly null) or
+// null when the base close or ALL forward closes are missing.
+function _edReactionFromLog(dailyLogSlice, dateKey) {
+  if (!dailyLogSlice || typeof dailyLogSlice !== 'object') return null;
+  const base = _keyToYmd(dateKey);
+  if (!base) return null;
+  // The slice is per-ticker ({dateKey:{SYM:px}}) — resolve the (single) symbol
+  // column robustly: prefer the base day's symbol, else first value per day.
+  const symLookup = (horizonDays, sym) => {
+    const targetMs = +base + horizonDays * 864e5;
+    for (let offset = 0; offset <= 3; offset++) {
+      const k = _localDateKey(new Date(targetMs + offset * 864e5));
+      const day = dailyLogSlice[k];
+      if (!day) continue;
+      const p = sym != null ? day[sym] : Object.values(day)[0];
+      if (p != null && Number.isFinite(+p) && +p > 0) return +p;
+    }
+    return null;
+  };
+  // Determine the symbol from the base day (first key), so multi-day slices
+  // consistently track ONE ticker column.
+  let sym = null;
+  {
+    const baseKeyMs = +base;
+    for (let offset = 0; offset <= 3 && sym == null; offset++) {
+      const k = _localDateKey(new Date(baseKeyMs + offset * 864e5));
+      const day = dailyLogSlice[k];
+      if (day) { const ks = Object.keys(day); if (ks.length) sym = ks[0]; }
+    }
+  }
+  const refClose = symLookup(0, sym);
+  if (refClose == null) return null;
+  const p1 = symLookup(1, sym);
+  const p3 = symLookup(3, sym);
+  const ret1d = p1 != null ? +(p1 / refClose - 1).toFixed(4) : null;
+  const ret3d = p3 != null ? +(p3 / refClose - 1).toFixed(4) : null;
+  if (ret1d == null && ret3d == null) return null;
+  return { ret1d, ret3d };
+}
+
+// Pure aggregate over recorded drift events → { n, upRate, medRet3d,
+// tendency: 'carries-up'|'carries-down'|'mixed' } or null on no usable data.
+// tendency needs n≥2 AND upRate ≥ 2/3 (or ≤ 1/3); otherwise 'mixed'.
+function computeEarningsDriftStats(events) {
+  if (!Array.isArray(events) || !events.length) return null;
+  const rets = events
+    .map(e => (e && e.ret3d != null && Number.isFinite(+e.ret3d)) ? +e.ret3d
+            : (e && e.ret1d != null && Number.isFinite(+e.ret1d)) ? +e.ret1d : null)
+    .filter(v => v != null);
+  if (!rets.length) return null;
+  const n = rets.length;
+  const ups = rets.filter(r => r > 0).length;
+  const upRateRaw = ups / n;
+  const sorted = [...rets].sort((a, b) => a - b);
+  const m = Math.floor(n / 2);
+  const medRet3d = +(n % 2 ? sorted[m] : (sorted[m - 1] + sorted[m]) / 2).toFixed(4);
+  let tendency = 'mixed';
+  if (n >= 2 && upRateRaw >= 2 / 3) tendency = 'carries-up';
+  else if (n >= 2 && upRateRaw <= 1 / 3) tendency = 'carries-down';
+  return { n, upRate: +upRateRaw.toFixed(2), medRet3d, tendency };
+}
+
+// Pure prompt line for the per-ticker intelligence block. One compact line
+// while daysAfter ∈ [0,5] and a tendency is actually learned (n≥2, non-mixed);
+// '' otherwise so absent data stays silent.
+function buildEarningsDriftPromptLine(sym, events, daysAfter) {
+  if (!Number.isFinite(daysAfter) || daysAfter < 0 || daysAfter > 5) return '';
+  const stats = computeEarningsDriftStats(events);
+  if (!stats || stats.n < 2 || stats.tendency === 'mixed') return '';
+  const dir = stats.tendency === 'carries-up' ? 'up' : 'down';
+  const ups = Math.round(stats.upRate * stats.n);
+  const med = stats.medRet3d * 100;
+  return `- ${sym}: post-earnings drift history: carries ${dir} (${ups} of ${stats.n} up, median 3d ${med >= 0 ? '+' : ''}${med.toFixed(1)}%)`;
+}
+
+// Recorder — runs in the refreshMarketAI collect phase. For each ticker whose
+// last report is daysAfter ∈ [1,4], grade the realized drift from
+// S.dailyPriceLog, dedup by event key, and save() ONLY when something changed
+// (new event, or a ret3d backfill on an event graded before +3d existed).
+function recordEarningsDrift(tickers) {
+  try {
+    if (typeof S === 'undefined' || !S) return;
+    const now = Date.now();
+    let changed = false;
+    for (const sym of (tickers || [])) {
+      const d = (typeof stockCache !== 'undefined' && stockCache[sym]) || null;
+      const eRaw = d && d.earningsDate;
+      const eTs = eRaw ? (typeof eRaw === 'number' ? eRaw * 1000 : eRaw) : null;
+      if (!eTs || eTs > now) continue;
+      const daysAfter = Math.round((now - eTs) / 86400_000);
+      if (daysAfter < ED_RECORD_MIN_D || daysAfter > ED_RECORD_MAX_D) continue;
+      const k = _localDateKey(new Date(eTs));
+      // Per-ticker log slice so the pure core sees exactly one symbol column.
+      const slice = {};
+      for (const [day, snap] of Object.entries(S.dailyPriceLog || {})) {
+        if (snap && snap[sym] != null) slice[day] = { [sym]: snap[sym] };
+      }
+      const rx = _edReactionFromLog(slice, k);
+      if (!rx) continue;
+      S.earningsDrift = (S.earningsDrift && typeof S.earningsDrift === 'object') ? S.earningsDrift : {};
+      const rec = S.earningsDrift[sym] || (S.earningsDrift[sym] = { events: [], asOf: 0 });
+      if (!Array.isArray(rec.events)) rec.events = [];
+      const existing = rec.events.find(e => e && e.k === k);
+      if (existing) {
+        // Dedup by event key; only backfill a ret3d that wasn't gradeable yet.
+        if (existing.ret3d == null && rx.ret3d != null) { existing.ret3d = rx.ret3d; changed = true; }
+        continue;
+      }
+      rec.events.push({ k, ret1d: rx.ret1d, ret3d: rx.ret3d });
+      rec.events.sort((a, b) => (a.k < b.k ? -1 : a.k > b.k ? 1 : 0));
+      const cutoff = _localDateKey(new Date(now - ED_PRUNE_DAYS * 864e5));
+      rec.events = rec.events.filter(e => e && e.k >= cutoff);
+      while (rec.events.length > ED_MAX_EVENTS) rec.events.shift();
+      rec.asOf = now;
+      changed = true;
+      console.log(`[EarnDrift] ${sym}: recorded ${k} ret1d=${rx.ret1d} ret3d=${rx.ret3d}`);
+    }
+    if (changed) save();
+  } catch (e) { console.warn('[EarnDrift] record failed:', e?.message || e); }
+}
+
 // Compute dividend proximity signal
 function computeDividendProximity(stockData) {
   const { symbol, exDividendDate, dividendDate } = stockData || {};
@@ -16974,6 +17224,47 @@ function computeFibonacciLevels(closes, opts) {
   };
 }
 
+// [feat:fib-llm] Role-aware wrapper over computeFibonacciLevels. Pure.
+// An UP swing puts retracement levels BELOW the high → they act as SUPPORT;
+// a DOWN swing puts them ABOVE the low → they act as RESISTANCE. Returns
+// { direction, swingPct, current, role, levels:[{label,price,distPct,primary}],
+//   nearest:{label,price,distPct} } or null (thin/flat window).
+function computeSupportResistanceLevels(closes) {
+  let fib = null;
+  try { fib = computeFibonacciLevels(closes); } catch (_) { fib = null; }
+  if (!fib) return null;
+  const role = fib.direction === 'up' ? 'support' : 'resistance';
+  const levels = fib.levels.map(l => ({ label: l.label, price: l.price, distPct: l.distPct, primary: !!l.primary }));
+  let nearest = levels[0];
+  for (const l of levels) if (Math.abs(l.distPct) < Math.abs(nearest.distPct)) nearest = l;
+  return {
+    direction: fib.direction,
+    swingPct: fib.swingPct,
+    current: fib.current,
+    role,
+    levels,
+    nearest: { label: nearest.label, price: nearest.price, distPct: nearest.distPct },
+  };
+}
+
+// [feat:fib-llm] Compact prompt block — ONE line per ticker with a computable
+// swing, plus a 2-line legend. Pure; '' when nothing to say (block omitted).
+function buildSupportLevelsPromptBlock(supportBySym) {
+  const syms = Object.keys(supportBySym || {}).filter(s => supportBySym[s]);
+  if (!syms.length) return '';
+  const lines = syms.map(sym => {
+    const sr = supportBySym[sym];
+    const sign = sr.direction === 'up' ? '+' : '-';
+    const deep = sr.levels.find(l => l.label === '78.6%');
+    const deepTxt = deep ? `; deep ${sr.role} $${deep.price.toFixed(2)} (78.6%)` : '';
+    const away = `${sr.nearest.distPct >= 0 ? '+' : ''}${sr.nearest.distPct.toFixed(1)}%`;
+    return `- ${sym}: ${sr.direction.toUpperCase()} swing (${sign}${Math.abs(sr.swingPct).toFixed(0)}%) → nearest ${sr.role} $${sr.nearest.price.toFixed(2)} (${sr.nearest.label}), ${away} away${deepTxt}`;
+  });
+  return `\n\nFIBONACCI SUPPORT/RESISTANCE LEVELS (retracements of each ticker's dominant 90d swing — self-fulfilling landmarks, not predictions):
+- Levels act as SUPPORT below price after an UP swing and RESISTANCE above price after a DOWN swing. A hold at the 61.8% level conventionally reads "trend intact"; a slice through 78.6% means the swing is fully unwinding.
+${lines.join('\n')}`;
+}
+
 // ── Gap-stacking state — invert pre-market when gaps are stacking ─────────
 // Tracks per-ticker gap history. When 3+ consecutive same-direction gaps
 // total >5%, the *next* pre-market gap is treated as EXHAUSTION (not
@@ -17232,7 +17523,7 @@ INTERPRETATION:
   return sections.length ? `\n\n${sections.join('\n\n')}` : '';
 }
 
-function buildMarketAiPrompt(newsByTicker, futuresData, optionsByTicker, movingAveragesByTicker, preMarketSignals, earningsProximity, dividendProximity, relativeStrength, volRegime, macroSig, priceContextSignals, fomcProximity, quantBaselineByTicker) {
+function buildMarketAiPrompt(newsByTicker, futuresData, optionsByTicker, movingAveragesByTicker, preMarketSignals, earningsProximity, dividendProximity, relativeStrength, volRegime, macroSig, priceContextSignals, fomcProximity, quantBaselineByTicker, supportBySym) {
   const lines = [];
   const now = Date.now();
   for (const [sym, items] of Object.entries(newsByTicker)) {
@@ -17248,6 +17539,8 @@ function buildMarketAiPrompt(newsByTicker, futuresData, optionsByTicker, movingA
   const futuresBlock = futuresData ? buildFuturesPromptBlock(futuresData) : '';
   const optionsBlock = optionsByTicker ? buildOptionsPromptBlock(optionsByTicker) : '';
   const maBlock = movingAveragesByTicker ? buildMovingAveragesPromptBlock(movingAveragesByTicker) : '';
+  // [feat:fib-llm] fib support/resistance levels — one compact line per ticker.
+  const supportBlock = supportBySym ? buildSupportLevelsPromptBlock(supportBySym) : '';
   const enhancedBlock = buildEnhancedSignalsPromptBlock(preMarketSignals, earningsProximity, dividendProximity, relativeStrength, volRegime, priceContextSignals, fomcProximity);
   const macroBlock = macroSig ? buildMacroPromptBlock(macroSig) : '';
   // Quant baseline block (NEW 2026-05-15) — every upstream model now sees
@@ -17295,8 +17588,21 @@ function buildMarketAiPrompt(newsByTicker, futuresData, optionsByTicker, movingA
   if (typeof buildSocialDivergenceBlock === 'function') {
     for (const sym of allSyms) { try { socialDivBlocks[sym] = buildSocialDivergenceBlock(sym); } catch(_) {} }
   }
+  // [feat:earnings-drift] learned post-earnings drift — one line while the
+  // ticker is 0-5 days past a report AND a tendency is learned (n≥2).
+  const earningsDriftBlocks = {};
+  if (typeof buildEarningsDriftPromptLine === 'function' && typeof S !== 'undefined' && S?.earningsDrift) {
+    const nowTs = Date.now();
+    for (const sym of allSyms) { try {
+      const eRaw = (typeof stockCache !== 'undefined' && stockCache[sym]) ? stockCache[sym].earningsDate : null;
+      const eTs = eRaw ? (typeof eRaw === 'number' ? eRaw * 1000 : eRaw) : null;
+      if (!eTs || eTs > nowTs) continue;
+      const daysAfter = Math.round((nowTs - eTs) / 86400_000);
+      earningsDriftBlocks[sym] = buildEarningsDriftPromptLine(sym, S.earningsDrift[sym]?.events, daysAfter);
+    } catch(_) {} }
+  }
   const perTickerIntelBlock = [...allSyms].map(sym => {
-    const parts = [insiderBlocks[sym], sectorTickerBlocks[sym], kalshiTickerBlocks[sym], hormuzTickerBlocks[sym], earningsRxnBlocks[sym], socialDivBlocks[sym]].filter(Boolean);
+    const parts = [insiderBlocks[sym], sectorTickerBlocks[sym], kalshiTickerBlocks[sym], hormuzTickerBlocks[sym], earningsRxnBlocks[sym], socialDivBlocks[sym], earningsDriftBlocks[sym]].filter(Boolean);
     return parts.length ? `\n[${sym} INTELLIGENCE]\n${parts.join('\n')}` : '';
   }).filter(Boolean).join('\n');
   const horizonDays = getHorizonDays();
@@ -17321,7 +17627,7 @@ Rules:
 - Technical trend (especially strong-uptrend/strong-downtrend) should confirm or contradict fundamental news — use it to adjust confidence.
 - IMPORTANT: Pre-market gaps, earnings proximity, dividend proximity, and relative strength are HIGH-IMPACT signals. Weight them heavily.
 - CRITICAL — DO NOT DEFAULT TO MOMENTUM EXTRAPOLATION: When the PRICE-CONTEXT block flags a parabolic blow-off, failed breakout, gap-stacking exhaustion, or DFH "rejection-zone" (2-5% below 52w high), those signals OVERRIDE the momentum signals. The biggest prediction losses come from buying the top of a parabolic move or shorting capitulation — the system's structural bias is toward "stock was going up so will keep going up", and these counter-momentum signals exist precisely to catch the regime-transition moments where that assumption fails.${horizonWeightNote}
-${futuresBlock}${optionsBlock}${maBlock}${enhancedBlock}${macroBlock}${quantBlock}${quantTrustBlock}${fredBlock}${eventBlock}${kalshiBlock}${hormuzBlock}${sectorBlock}
+${futuresBlock}${optionsBlock}${maBlock}${supportBlock}${enhancedBlock}${macroBlock}${quantBlock}${quantTrustBlock}${fredBlock}${eventBlock}${kalshiBlock}${hormuzBlock}${sectorBlock}
 TICKERS: ${syms}
 HEADLINES:
 ${headlineBlock}
@@ -17331,6 +17637,22 @@ JSON:`;
 
 // Robust JSON array extraction — handles models that wrap output in prose or
 // ``` fences despite the prompt's instructions.
+// _repairPredictionJson(s) — lenient repair for single-character model glitches
+// that break an otherwise-valid predictions payload. Seen in the wild (Gemini,
+// 2026-07-04): '"ticker "AMZN",' — the colon after the property name dropped —
+// which rejected a 100%-otherwise-valid 20-ticker array. Repairs are restricted
+// to the KNOWN property names of the predictions schema so a content string can
+// never be corrupted, and callers only try this AFTER a clean parse failed.
+function _repairPredictionJson(s) {
+  return String(s)
+    // '"ticker "AMZN"'  → '"ticker": "AMZN"'   (colon dropped, quote fused)
+    .replace(/"(ticker|sentiment|confidence|rationale|driver|predictions)\s+"/g, '"$1": "')
+    // '"ticker" "AMZN"' → '"ticker": "AMZN"'   (colon dropped, quote intact)
+    .replace(/"(ticker|sentiment|confidence|rationale|driver|predictions)"\s+(?=")/g, '"$1": ')
+    // '"confidence 75'  → '"confidence": 75'   (numeric value variant)
+    .replace(/"(confidence)\s+(-?\d+(?:\.\d+)?)/g, '"$1": $2');
+}
+
 function extractPredictionsJson(text) {
   if (!text) return null;
   let s = String(text).trim();
@@ -17365,6 +17687,10 @@ function extractPredictionsJson(text) {
   };
   try { const v = JSON.parse(s); const a = objToArray(v); if (a) return a; } catch (_) {}
 
+  // Step 3.5: lenient known-property repair (missing colon etc.) — only reached
+  // when the clean parse failed; can only turn a failed payload into a good one.
+  try { const v = JSON.parse(_repairPredictionJson(s)); const a = objToArray(v); if (a) return a; } catch (_) {}
+
   // Step 4: try recovering a truncated JSON (Groq sometimes hits max_tokens
   // mid-array). Find the first `[` and try parsing successively shorter
   // suffixes until something works, OR auto-close at the last complete `},`.
@@ -17374,6 +17700,8 @@ function extractPredictionsJson(text) {
     const aEnd = s.lastIndexOf(']');
     if (aEnd > aStart) {
       try { const v = JSON.parse(s.slice(aStart, aEnd + 1)); const a = objToArray(v); if (a) return a; } catch (_) {}
+      // Repaired variant of the same slice (prose around the array + a glitch inside it).
+      try { const v = JSON.parse(_repairPredictionJson(s.slice(aStart, aEnd + 1))); const a = objToArray(v); if (a) return a; } catch (_) {}
     }
     // Truncation-recovery: walk backwards from the end, find the last `}` that
     // is followed only by whitespace + `,` (incomplete next element) or `]`
@@ -19694,7 +20022,7 @@ function _ddFibonacciSection(sym, pred) {
     // side → green. Down-swing levels are resistance: below them is healthy.
     const distColor = (l.distPct >= 0) === (fib.direction === 'up') ? 'var(--success)' : 'var(--danger)';
     const nearChip = l.near
-      ? `<span style="margin-left:6px;font-size:9px;font-weight:700;color:var(--primary);">≈ at level</span>`
+      ? `<span style="margin-left:6px;font-size:9px;font-weight:700;color:var(--primary);">≈ at ${esc(roleWord)}</span>`
       : '';
     const rowWeight = l.primary ? '700' : '400';
     const rowColor  = l.primary ? 'var(--text)' : 'var(--muted)';
@@ -19707,7 +20035,7 @@ function _ddFibonacciSection(sym, pred) {
 
   const chart = (typeof _drawFibChart === 'function') ? _drawFibChart(closes, 560, 120, fib) : '';
   return `<div style="margin-bottom:14px;">
-    <div style="font-weight:800;font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--text);margin-bottom:6px;">Fibonacci Retracement — ${esc(sym)} &nbsp;<span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--muted);font-size:10px;">${fib.lookback}d swing ${esc(dirWord)} ${_ddFmtPct(fib.direction === 'up' ? fib.swingPct : -fib.swingPct, 1)} (${swingStr})</span></div>
+    <div style="font-weight:800;font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--text);margin-bottom:6px;">Fibonacci Retracement — ${esc(sym)} &nbsp;<span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--muted);font-size:10px;">${fib.lookback}d swing ${esc(dirWord)} ${_ddFmtPct(fib.direction === 'up' ? fib.swingPct : -fib.swingPct, 1)} (${swingStr}) · levels ${fib.direction === 'up' ? 'below act as support' : 'above act as resistance'}</span></div>
     <div style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;overflow:hidden;">
       <table style="width:100%;border-collapse:collapse;font-size:11px;">
         <thead><tr style="background:var(--surface);">
@@ -22980,6 +23308,23 @@ async function refreshMarketAI(force = false) {
       if (notes.length) console.log(`[PriceContext] ${sym}: ${notes.join(' · ')}`);
     }
 
+    // [feat:fib-llm] Support/resistance levels for the prompt — computed from
+    // the same closes fetchMovingAverages already provided (no new fetch).
+    const supportBySym = {};
+    for (const sym of tickers) {
+      const closes = movingAveragesByTicker?.[sym]?.closes;
+      if (!closes) continue;
+      try {
+        const sr = computeSupportResistanceLevels(closes);
+        if (sr) supportBySym[sym] = sr;
+      } catch (_) {}
+    }
+    if (Object.keys(supportBySym).length) console.log(`[FibSupport] levels for ${Object.keys(supportBySym).length} ticker(s) → prompt`);
+
+    // [feat:earnings-drift] Record realized post-earnings drift for tickers
+    // 1-4 days past a report (dedup by event key; save() only on change).
+    try { recordEarningsDrift(tickers); } catch (_) {}
+
     // Volatility regime (VIX-based confidence adjustment + term structure)
     const volRegime = await computeVolatilityRegime();
 
@@ -23060,7 +23405,7 @@ async function refreshMarketAI(force = false) {
       fomcProximity,
     });
 
-    const prompt = buildMarketAiPrompt(newsByTicker, futuresData, optionsByTicker, movingAveragesByTicker, preMarketSignals, earningsProximity, dividendProximity, relativeStrength, volRegime, macroSig, priceContextSignals, fomcProximity, quantBaselineByTicker);
+    const prompt = buildMarketAiPrompt(newsByTicker, futuresData, optionsByTicker, movingAveragesByTicker, preMarketSignals, earningsProximity, dividendProximity, relativeStrength, volRegime, macroSig, priceContextSignals, fomcProximity, quantBaselineByTicker, supportBySym);
 
     // Build the list of models we will *actually* query. Every configured
     // provider (Groq / Gemini / Mistral) requires a key in Settings. Every
