@@ -5768,6 +5768,24 @@ function _mergeTrackerLists(localArr, incomingArr, keyFn) {
 const _flightDedupKey = f => (f?.code || '') + '|' + (f?.date || '');
 const _hotelDedupKey  = h => String(h?.name || '').toLowerCase().trim() + '|' + (h?.checkIn || '');
 
+// Union-merge two watchlist symbol arrays: LOCAL order first (this device's list
+// is authoritative on a pull), then incoming-only symbols appended. Dedup on the
+// normalized symbol. Pure + top-level for the harness.
+function _mergeStockLists(localArr, incomingArr) {
+  const norm = s => String(s || '').toUpperCase().trim();
+  const out = [];
+  const seen = new Set();
+  for (const s of (Array.isArray(localArr) ? localArr : [])) {
+    const k = norm(s);
+    if (k && !seen.has(k)) { seen.add(k); out.push(s); }
+  }
+  for (const s of (Array.isArray(incomingArr) ? incomingArr : [])) {
+    const k = norm(s);
+    if (k && !seen.has(k)) { seen.add(k); out.push(s); }
+  }
+  return out;
+}
+
 // Merge an incoming (pulled/imported) day-keyed journal with the local one —
 // local days win (this machine's copy is the freshest it has), incoming-only
 // days fill in, and on a same-day collision a graded copy beats an ungraded
@@ -5844,6 +5862,16 @@ function _mergeLocalPreserves(merged, candidate, localState, opts) {
     if (L.bgImageOpacity != null) merged.bgImageOpacity = L.bgImageOpacity;
     if (L.bgImageDim     != null) merged.bgImageDim     = L.bgImageDim;
     if (L.widgetBgAlpha  != null) merged.widgetBgAlpha  = L.widgetBgAlpha;
+    // Watchlist: on a SYNC PULL, union-merge like the flight/hotel trackers —
+    // THIS device's ticker list is kept (order intact) and the cloud only ADDS
+    // symbols not present locally. A stale cloud copy can no longer clobber
+    // locally-added tickers. (Consequence, same as the trackers: deletions
+    // don't propagate via pull — remove a ticker on each device, or use an
+    // explicit file Import, where the incoming list still wins so a restore
+    // restores.)
+    if (Array.isArray(L.stocks) && L.stocks.length) {
+      merged.stocks = _mergeStockLists(L.stocks, merged.stocks);
+    }
   }
 
   merged.maiJournal    = _mergeMaiJournal(candidate.maiJournal);
